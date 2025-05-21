@@ -10,7 +10,140 @@ import (
 	"io"
 	"os"
 	"sort"
+
+	"github.com/NahomAnteneh/vec-server/internal/objects"
 )
+
+// Creator is responsible for creating packfiles
+type Creator struct {
+	objects []*objects.Object
+}
+
+// NewCreator creates a new packfile creator
+func NewCreator() *Creator {
+	return &Creator{
+		objects: make([]*objects.Object, 0),
+	}
+}
+
+// AddObject adds an object to the packfile
+func (c *Creator) AddObject(obj *objects.Object) error {
+	// Check if object already exists
+	for _, o := range c.objects {
+		if o.Hash == obj.Hash {
+			return nil
+		}
+	}
+
+	c.objects = append(c.objects, obj)
+	return nil
+}
+
+// WriteTo writes the packfile to the given writer
+func (c *Creator) WriteTo(w io.Writer) error {
+	// Write header
+	header := []byte{'P', 'A', 'C', 'K', 0, 0, 0, 2, 0, 0, 0, 0}
+	binary.BigEndian.PutUint32(header[8:], uint32(len(c.objects)))
+
+	// Create a buffer for the packfile
+	var buf bytes.Buffer
+	buf.Write(header)
+
+	// Write objects
+	for _, obj := range c.objects {
+		// Write object header
+		if err := writeObjectHeaderV2(&buf, obj); err != nil {
+			return err
+		}
+
+		// Write object data
+		zlibWriter := zlib.NewWriter(&buf)
+		if _, err := zlibWriter.Write(obj.Content); err != nil {
+			return err
+		}
+		if err := zlibWriter.Close(); err != nil {
+			return err
+		}
+	}
+
+	// Calculate checksum
+	packData := buf.Bytes()
+	h := sha1.New()
+	h.Write(packData)
+	checksum := h.Sum(nil)
+
+	// Write packfile data and checksum
+	if _, err := w.Write(packData); err != nil {
+		return err
+	}
+	if _, err := w.Write(checksum); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// writeObjectHeaderV2 writes an object header to the packfile
+func writeObjectHeaderV2(w io.Writer, obj *objects.Object) error {
+	// Map Vec object type to packfile object type
+	var objType byte
+	switch obj.Type {
+	case objects.ObjectTypeCommit:
+		objType = 1
+	case objects.ObjectTypeTree:
+		objType = 2
+	case objects.ObjectTypeBlob:
+		objType = 3
+	case objects.ObjectTypeTag:
+		objType = 4
+	default:
+		return fmt.Errorf("unsupported object type: %v", obj.Type)
+	}
+
+	// Write type and size using variable-length encoding
+	size := len(obj.Content)
+	firstByte := (objType << 4) | byte(size&0x0F)
+	size >>= 4
+
+	if size == 0 {
+		// If size fits in 4 bits, write a single byte
+		if err := writeByte(w, firstByte); err != nil {
+			return err
+		}
+	} else {
+		// Otherwise, use continuation bits
+		if err := writeByte(w, firstByte|0x80); err != nil {
+			return err
+		}
+
+		for {
+			if size == 0 {
+				break
+			}
+
+			// Set continuation bit if there are more bytes
+			nextByte := byte(size & 0x7F)
+			size >>= 7
+
+			if size > 0 {
+				nextByte |= 0x80
+			}
+
+			if err := writeByte(w, nextByte); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// writeByte writes a single byte to the writer
+func writeByte(w io.Writer, b byte) error {
+	buf := []byte{b}
+	_, err := w.Write(buf)
+	return err
+}
 
 // CreatePackfileFromObjects creates a binary packfile from a list of objects
 // This function handles in-memory objects rather than repository paths
@@ -113,7 +246,7 @@ func CreateModernPackfile(objects []Object, outputPath string) error {
 
 		// Write object header (type and size)
 		// For deltas, obj.Data is the delta payload. For non-deltas, it's the raw object data.
-		if err := writeObjectHeader(file, headerType, uint64(len(currentObjectData))); err != nil {
+		if err := writeObjectHeaderV1(file, headerType, uint64(len(currentObjectData))); err != nil {
 			return fmt.Errorf("failed to write object header for %s: %w", obj.Hash, err)
 		}
 
@@ -181,9 +314,9 @@ func CreateModernPackfile(objects []Object, outputPath string) error {
 	return nil
 }
 
-// writeObjectHeader writes the packfile object header in Git format
+// writeObjectHeaderV1 writes the packfile object header in Git format
 // Uses a variable-length encoding for the size and includes type in the first byte
-func writeObjectHeader(file *os.File, objType ObjectType, size uint64) error {
+func writeObjectHeaderV1(file *os.File, objType ObjectType, size uint64) error {
 	// First byte: high 3 bits are type, low 4 bits are first chunk of size, bit 7 is continuation bit
 	firstByte := byte((uint8(objType) << 4) & 0x70) // Type in bits 4-6
 
@@ -201,21 +334,20 @@ func writeObjectHeader(file *os.File, objType ObjectType, size uint64) error {
 		return fmt.Errorf("failed to write object header first byte: %w", err)
 	}
 
-	// Write additional size bytes if needed, 7 bits at a time, with continuation bit
+	// Write remaining size bytes if needed
 	remainingSize := size >> 4
 	for remainingSize > 0 {
-		// Next 7 bits of the size
+		// Each subsequent byte: bit 7 is continuation bit, bits 0-6 are next 7 bits of size
 		nextByte := byte(remainingSize & 0x7F)
-
-		// If there are more bits after this, set the continuation bit
 		remainingSize >>= 7
+
+		// Set continuation bit if there are more bytes
 		if remainingSize > 0 {
 			nextByte |= 0x80
 		}
 
-		// Write this byte
 		if _, err := file.Write([]byte{nextByte}); err != nil {
-			return fmt.Errorf("failed to write object header size byte: %w", err)
+			return fmt.Errorf("failed to write object header continuation byte: %w", err)
 		}
 	}
 

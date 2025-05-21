@@ -43,29 +43,39 @@ func main() {
 	}
 	log.Println("Connected to database")
 
+	// Run database migrations
+	if err := db.RunMigrations(database); err != nil {
+		log.Fatalf("Failed to run database migrations: %v", err)
+	}
+	log.Println("Database migrations completed successfully")
+
 	// Create repository manager
 	repoManager := repository.NewManager(cfg)
 
 	// Create router
 	router := api.SetupRouter(cfg, repoManager)
 
-	// Configure HTTP server
+	// Configure HTTP server with timeouts that match client expectations (60s default)
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.ServerPort),
 		Handler:      router,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		ReadTimeout:  60 * time.Second,
+		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,
+		// Increasing header limit for large packfile transfers
+		MaxHeaderBytes: 1 << 20, // 1MB
 	}
 
 	// Start server in a goroutine so it doesn't block
 	go func() {
 		log.Printf("Vec server listening on port %d", cfg.ServerPort)
 		if cfg.IsTLSEnabled() {
+			log.Println("TLS enabled, starting HTTPS server")
 			if err := server.ListenAndServeTLS(cfg.TLSCertPath, cfg.TLSKeyPath); err != nil && err != http.ErrServerClosed {
 				log.Fatalf("ListenAndServeTLS failed: %v", err)
 			}
 		} else {
+			log.Println("TLS disabled, starting HTTP server")
 			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				log.Fatalf("ListenAndServe failed: %v", err)
 			}

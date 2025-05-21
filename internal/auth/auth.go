@@ -6,7 +6,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/NahomAnteneh/vec-server/internal/db"
+	"github.com/NahomAnteneh/vec-server/internal/db/models"
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
@@ -44,51 +44,11 @@ func CheckPasswordHash(password, hash string) bool {
 	return err == nil
 }
 
-// GenerateToken creates a new JWT token for a user
-func GenerateToken(userID uint, secret string) (string, error) {
-	expirationTime := time.Now().Add(TokenExpiration)
-
-	claims := &Claims{
-		UserID: userID,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(expirationTime),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-		},
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString([]byte(secret))
-}
-
-// VerifyToken validates a JWT token
-func VerifyToken(tokenString, secret string) (*Claims, error) {
-	claims := &Claims{}
-
-	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
-		return []byte(secret), nil
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	if !token.Valid {
-		return nil, ErrInvalidToken
-	}
-
-	// Check if token is expired
-	if time.Until(time.Unix(claims.ExpiresAt.Unix(), 0)) < 0 {
-		return nil, ErrTokenExpired
-	}
-
-	return claims, nil
-}
-
 // AuthenticateUser verifies user credentials
-func AuthenticateUser(username, password string) (*db.User, error) {
-	var user db.User
+func AuthenticateUser(db *gorm.DB, username, password string) (*models.User, error) {
+	var user models.User
 
-	result := db.GetDB().Where("username = ?", username).First(&user)
+	result := db.Where("username = ?", username).First(&user)
 	if result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 			return nil, ErrInvalidCredentials
@@ -103,8 +63,20 @@ func AuthenticateUser(username, password string) (*db.User, error) {
 	return &user, nil
 }
 
+// AuthToken represents an authentication token
+type AuthToken struct {
+	ID          uint        `json:"id" gorm:"primarykey"`
+	UserID      uint        `json:"user_id" gorm:"not null"`
+	User        models.User `json:"user" gorm:"foreignKey:UserID"`
+	TokenHash   string      `json:"-" gorm:"size:255;not null"`
+	Description string      `json:"description" gorm:"size:255"`
+	ExpiresAt   *time.Time  `json:"expires_at"`
+	CreatedAt   time.Time   `json:"created_at"`
+	UpdatedAt   time.Time   `json:"updated_at"`
+}
+
 // CreateAuthToken generates a new authentication token for a user
-func CreateAuthToken(userID uint, description string) (*db.AuthToken, string, error) {
+func CreateAuthToken(db *gorm.DB, userID uint, description string) (*AuthToken, string, error) {
 	// Generate a random token
 	token := make([]byte, 32)
 	_, err := rand.Read(token)
@@ -124,14 +96,14 @@ func CreateAuthToken(userID uint, description string) (*db.AuthToken, string, er
 	expiresAt := time.Now().Add(90 * 24 * time.Hour) // 90 days
 
 	// Create token record
-	authToken := &db.AuthToken{
+	authToken := &AuthToken{
 		UserID:      userID,
 		TokenHash:   hash,
 		Description: description,
 		ExpiresAt:   &expiresAt,
 	}
 
-	if err := db.GetDB().Create(authToken).Error; err != nil {
+	if err := db.Create(authToken).Error; err != nil {
 		return nil, "", err
 	}
 
@@ -139,11 +111,11 @@ func CreateAuthToken(userID uint, description string) (*db.AuthToken, string, er
 }
 
 // VerifyAuthToken checks if a personal access token is valid
-func VerifyAuthToken(tokenStr string) (*db.User, error) {
-	var tokens []db.AuthToken
+func VerifyAuthToken(db *gorm.DB, tokenStr string) (*models.User, error) {
+	var tokens []AuthToken
 
 	// Get all tokens - we'll need to check each hash
-	if err := db.GetDB().Preload("User").Find(&tokens).Error; err != nil {
+	if err := db.Preload("User").Find(&tokens).Error; err != nil {
 		return nil, err
 	}
 

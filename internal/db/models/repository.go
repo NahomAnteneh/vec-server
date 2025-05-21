@@ -14,6 +14,7 @@ type Repository struct {
 	OwnerID   uint      `json:"owner_id" gorm:"not null"`
 	Owner     User      `json:"owner" gorm:"foreignKey:OwnerID"`
 	IsPublic  bool      `json:"is_public" gorm:"default:false"`
+	Path      string    `json:"path" gorm:"-"` // Path is not stored in the database
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

@@ -13,6 +13,70 @@ const (
 	VecDirName = ".vec"
 )
 
+// ObjectType represents the type of a Vec object
+type ObjectType int
+
+const (
+	// ObjectTypeBlob represents a blob object
+	ObjectTypeBlob ObjectType = iota
+	// ObjectTypeTree represents a tree object
+	ObjectTypeTree
+	// ObjectTypeCommit represents a commit object
+	ObjectTypeCommit
+	// ObjectTypeTag represents a tag object
+	ObjectTypeTag
+)
+
+// String returns the string representation of an object type
+func (t ObjectType) String() string {
+	switch t {
+	case ObjectTypeBlob:
+		return "blob"
+	case ObjectTypeTree:
+		return "tree"
+	case ObjectTypeCommit:
+		return "commit"
+	case ObjectTypeTag:
+		return "tag"
+	default:
+		return "unknown"
+	}
+}
+
+// ParseObjectType parses an object type from a string
+func ParseObjectType(s string) (ObjectType, error) {
+	switch s {
+	case "blob":
+		return ObjectTypeBlob, nil
+	case "tree":
+		return ObjectTypeTree, nil
+	case "commit":
+		return ObjectTypeCommit, nil
+	case "tag":
+		return ObjectTypeTag, nil
+	default:
+		return 0, fmt.Errorf("unknown object type: %s", s)
+	}
+}
+
+// Object represents a Vec object
+type Object struct {
+	Hash    string
+	Type    ObjectType
+	Content []byte
+	// For delta objects
+	BaseHash string
+}
+
+// Serialize serializes an object to bytes
+func (o *Object) Serialize() ([]byte, error) {
+	header := fmt.Sprintf("%s %d\x00", o.Type.String(), len(o.Content))
+	result := make([]byte, len(header)+len(o.Content))
+	copy(result, []byte(header))
+	copy(result[len(header):], o.Content)
+	return result, nil
+}
+
 // HashFile calculates the SHA-256 hash of a file, including the Vec object header.
 func HashFile(filePath string) (string, error) {
 	content, err := os.ReadFile(filePath)

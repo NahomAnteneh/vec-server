@@ -8,7 +8,7 @@ import (
 	"sync"
 
 	"github.com/NahomAnteneh/vec-server/internal/config"
-	"github.com/NahomAnteneh/vec-server/internal/db"
+	"github.com/NahomAnteneh/vec-server/internal/db/models"
 )
 
 var (
@@ -42,8 +42,25 @@ func (m *Manager) LockRepo(repoPath string) func() {
 }
 
 // GetRepoPath returns the filesystem path for a repository
-func (m *Manager) GetRepoPath(repo *db.Repository) string {
-	return repo.Path
+func (m *Manager) GetRepoPath(ownerOrRepo interface{}, repoName ...string) string {
+	// If passed a repository object
+	if repo, ok := ownerOrRepo.(*models.Repository); ok {
+		return repo.Path
+	}
+
+	// If passed owner and repo name strings
+	if owner, ok := ownerOrRepo.(string); ok && len(repoName) > 0 {
+		return filepath.Join(m.cfg.RepoBasePath, owner, repoName[0]+".vec")
+	}
+
+	// Default case (should not happen)
+	return ""
+}
+
+// RepositoryExists checks if a repository exists
+func (m *Manager) RepositoryExists(owner, repoName string) bool {
+	repoPath := m.GetRepoPath(owner, repoName)
+	return m.RepoExists(repoPath)
 }
 
 // RepoExists checks if a repository exists at the given path
@@ -58,7 +75,7 @@ func (m *Manager) RepoExists(path string) bool {
 }
 
 // CreateRepo creates a new bare repository
-func (m *Manager) CreateRepo(owner *db.User, repoName string) (string, error) {
+func (m *Manager) CreateRepo(owner *models.User, repoName string) (string, error) {
 	// Generate repository path using owner's username and repository name
 	ownerPath := filepath.Join(m.cfg.RepoBasePath, owner.Username)
 	repoPath := filepath.Join(ownerPath, repoName+".vec")
@@ -114,7 +131,7 @@ func (m *Manager) CreateRepo(owner *db.User, repoName string) (string, error) {
 }
 
 // DeleteRepo deletes a repository
-func (m *Manager) DeleteRepo(repo *db.Repository) error {
+func (m *Manager) DeleteRepo(repo *models.Repository) error {
 	// Acquire lock for this repo
 	unlock := m.LockRepo(repo.Path)
 	defer unlock()
@@ -133,7 +150,7 @@ func (m *Manager) DeleteRepo(repo *db.Repository) error {
 }
 
 // GetRefs returns a list of all references in a repository
-func (m *Manager) GetRefs(repo *db.Repository) (map[string]string, error) {
+func (m *Manager) GetRefs(repo *models.Repository) (map[string]string, error) {
 	refs := make(map[string]string)
 
 	// Get path to refs directory
