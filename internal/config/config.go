@@ -6,6 +6,12 @@ import (
 	"strconv"
 )
 
+// AuthConfig holds authentication configuration
+type AuthConfig struct {
+	CustomHeaderName string
+	CustomHeaderType string // "username" or "token"
+}
+
 // Config holds all application configuration
 type Config struct {
 	// Server configuration
@@ -21,6 +27,9 @@ type Config struct {
 
 	// JWT configuration
 	JWTSecret string
+
+	// Authentication configuration
+	Auth AuthConfig
 }
 
 // IsTLSEnabled returns true if TLS is enabled
@@ -33,10 +42,14 @@ func LoadConfig() *Config {
 	cfg := &Config{
 		ServerPort:   getEnvInt("SERVER_PORT", 8080),
 		RepoBasePath: getEnvStr("REPO_BASE_PATH", "./repos"),
-		DatabaseURL:  getEnvStr("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/vecserver?sslmode=disable"),
+		DatabaseURL:  getEnvStr("DATABASE_URL", "postgresql://neondb_owner:npg_8OKrybDhPx5T@ep-lucky-waterfall-a51p4m44-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require"),
 		TLSCertPath:  getEnvStr("TLS_CERT_PATH", ""),
 		TLSKeyPath:   getEnvStr("TLS_KEY_PATH", ""),
 		JWTSecret:    getEnvStr("JWT_SECRET", "vec-server-default-secret-key"),
+		Auth: AuthConfig{
+			CustomHeaderName: getEnvStr("AUTH_CUSTOM_HEADER_NAME", ""),
+			CustomHeaderType: getEnvStr("AUTH_CUSTOM_HEADER_TYPE", "username"),
+		},
 	}
 
 	log.Printf("Server configuration: port=%d, repo_path=%s", cfg.ServerPort, cfg.RepoBasePath)

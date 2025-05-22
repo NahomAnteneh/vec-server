@@ -1,26 +1,32 @@
 package api
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 
+	"github.com/NahomAnteneh/vec-server/internal/api/handlers"
 	vecmiddleware "github.com/NahomAnteneh/vec-server/internal/api/middleware"
 	"github.com/NahomAnteneh/vec-server/internal/config"
 	"github.com/NahomAnteneh/vec-server/internal/db/models"
+	"github.com/NahomAnteneh/vec-server/internal/protocol"
 	"github.com/NahomAnteneh/vec-server/internal/repository"
+	"gorm.io/gorm"
 )
 
 // SetupRouter configures the HTTP router for the API
-func SetupRouter(cfg *config.Config, repoManager *repository.Manager) http.Handler {
+func SetupRouter(cfg *config.Config, repoManager *repository.Manager, db *gorm.DB) http.Handler {
 	r := chi.NewRouter()
 
 	// Standard middleware
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Logger)
 	r.Use(chimiddleware.Recoverer)
+	r.Use(vecmiddleware.Logging())
+	r.Use(vecmiddleware.RequestIDMiddleware())
 
 	// CORS configuration
 	cors := cors.New(cors.Options{
@@ -33,172 +39,117 @@ func SetupRouter(cfg *config.Config, repoManager *repository.Manager) http.Handl
 	r.Use(cors.Handler)
 
 	// Authentication middleware
-	r.Use(vecmiddleware.AuthenticationMiddleware(cfg))
+	r.Use(vecmiddleware.AuthenticationMiddleware(cfg, db))
 
-	// API routes
-	r.Route("/api", func(r chi.Router) {
-		// User management
-		r.Route("/users", func(r chi.Router) {
-			r.Post("/", CreateUserHandler())
-			r.Get("/", ListUsersHandler())
+	// Create services
+	userService := models.NewUserService(db)
+	repoService := models.NewRepositoryService(db)
+	permService := models.NewPermissionService(db)
 
-			r.Route("/{username}", func(r chi.Router) {
-				r.Get("/", GetUserHandler())
-				r.Put("/", UpdateUserHandler())
-				r.Delete("/", DeleteUserHandler())
+	// API v1 routes (versioned API) for repositories only
+	r.Route("/", func(r chi.Router) {
+		// Repository listing - no specific user
+		r.Get("/repos", handlers.ListUserRepositories(repoService))
+		// Add a new POST route for creating repositories
+		r.Post("/repos", handlers.CreateRepository(repoService))
 
-				// User tokens
-				r.Route("/tokens", func(r chi.Router) {
-					r.Get("/", GetUserTokensHandler())
-					r.Post("/", CreateUserTokenHandler())
-					r.Delete("/{token_id}", DeleteUserTokenHandler())
-				})
-			})
-		})
+		// Repository specific routes - direct username/repo pattern
+		r.Route("/{username}/{repo}", func(r chi.Router) {
+			// Repository middleware
+			r.Use(createRepositoryMiddleware(db, repoManager))
 
-		// Repository management
-		r.Route("/repos", func(r chi.Router) {
-			r.Post("/", CreateRepositoryHandler(repoManager))
-			r.Get("/", ListRepositoriesHandler())
+			r.Get("/", handlers.GetRepository(repoService))
+			r.Put("/", handlers.UpdateRepository(repoService))
+			r.Delete("/", handlers.DeleteRepository(repoService))
 
-			// Repository specific routes
-			r.Route("/{owner}/{repo}", func(r chi.Router) {
-				// Repository middleware
-				r.Use(vecmiddleware.RepositoryMiddleware)
-
-				r.Get("/", GetRepositoryHandler())
-				r.Delete("/", func(w http.ResponseWriter, r *http.Request) {
-					DeleteRepositoryHandler(repoManager)(w, r)
-				})
-
-				// Repository permissions
-				r.Route("/permissions", func(r chi.Router) {
-					r.Use(func(next http.Handler) http.Handler {
-						return vecmiddleware.RequirePermission(models.AdminPermission)(next)
-					})
-					r.Get("/", GetRepositoryPermissionsHandler())
-					r.Post("/", AddRepositoryPermissionHandler())
-					r.Put("/{username}", UpdateRepositoryPermissionHandler())
-					r.Delete("/{username}", RemoveRepositoryPermissionHandler())
-				})
+			// Repository permissions
+			r.Route("/permissions", func(r chi.Router) {
+				r.Use(vecmiddleware.RequirePermission(models.AdminPermission))
+				r.Get("/", handlers.ListCollaborators(repoService, permService))
+				r.Post("/", handlers.AddCollaborator(userService, repoService, permService))
+				r.Put("/{username}", handlers.UpdateCollaboratorPermissions(userService, repoService, permService))
+				r.Delete("/{username}", handlers.RemoveCollaborator(userService, repoService, permService))
 			})
 		})
 	})
 
-	// Vec Smart HTTP protocol endpoints
-	r.Route("/repos/{owner}/{repo}", func(r chi.Router) {
-		r.Use(vecmiddleware.RepositoryMiddleware)
+	// Vec Smart HTTP protocol endpoints (non-versioned) with direct username/repo pattern
+	// These must match exactly what the client expects
+	r.Route("/{username}/{repo}", func(r chi.Router) {
+		r.Use(createRepositoryMiddleware(db, repoManager))
 
 		// Info/refs endpoint
-		r.Get("/info/refs", InfoRefsHandler(repoManager))
+		r.Get("/info/refs", protocol.InfoRefsHandler(repoManager))
 
 		// Upload-pack endpoint (fetch)
-		r.With(func(next http.Handler) http.Handler {
-			return vecmiddleware.RequirePermission(models.ReadPermission)(next)
-		}).Post("/vec-upload-pack", UploadPackHandler(repoManager))
+		r.With(vecmiddleware.RequirePermission(models.ReadPermission)).
+			Post("/vec-upload-pack", protocol.UploadPackHandler(repoManager))
 
 		// Receive-pack endpoint (push)
-		r.With(func(next http.Handler) http.Handler {
-			return vecmiddleware.RequirePermission(models.WritePermission)(next)
-		}).Post("/vec-receive-pack", ReceivePackHandler(repoManager))
+		r.With(vecmiddleware.RequirePermission(models.WritePermission)).
+			Post("/vec-receive-pack", protocol.ReceivePackHandler(repoManager))
 	})
 
 	return r
 }
 
-// Placeholder handlers - these would be implemented in separate files
-func CreateUserHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Not implemented yet"))
-	}
-}
+// createRepositoryMiddleware creates repository context middleware that loads the repository
+// from the database and adds it to the request context
+func createRepositoryMiddleware(db *gorm.DB, repoManager *repository.Manager) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Get owner and repo name from URL
+			username := chi.URLParam(r, "username")
+			repoName := chi.URLParam(r, "repo")
 
-func ListUsersHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Not implemented yet"))
-	}
-}
+			if username == "" || repoName == "" {
+				http.Error(w, "Invalid repository path", http.StatusBadRequest)
+				return
+			}
 
-func GetUserHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Not implemented yet"))
-	}
-}
+			// Get repository from database
+			repoService := models.NewRepositoryService(db)
+			repo, err := repoService.GetByUsername(username, repoName)
+			if err != nil {
+				http.Error(w, "Repository not found", http.StatusNotFound)
+				return
+			}
 
-func UpdateUserHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Not implemented yet"))
-	}
-}
+			// Set repository path in the model if it's not already set
+			if repo.Path == "" {
+				repo.Path = repoManager.GetRepoPath(username, repoName)
+				if err := repoService.Update(repo); err != nil {
+					http.Error(w, "Failed to update repository path", http.StatusInternalServerError)
+					return
+				}
+			}
 
-func DeleteUserHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Not implemented yet"))
-	}
-}
+			// Get user from repository
+			userService := models.NewUserService(db)
+			owner, err := userService.GetByID(repo.OwnerID)
+			if err != nil {
+				http.Error(w, "Failed to get repository owner", http.StatusInternalServerError)
+				return
+			}
 
-func GetUserTokensHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Not implemented yet"))
-	}
-}
+			// Ensure repository exists on disk
+			if err := repoManager.SyncRepository(repo, owner); err != nil {
+				http.Error(w, "Failed to sync repository: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
 
-func CreateUserTokenHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Not implemented yet"))
-	}
-}
+			// Create repository context
+			repoContext := &vecmiddleware.RepositoryContext{
+				Repository: repo,
+				DB:         db,
+			}
 
-func DeleteUserTokenHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Not implemented yet"))
-	}
-}
+			// Add repository context to request context
+			ctx := r.Context()
+			ctx = context.WithValue(ctx, vecmiddleware.RepositoryContextKey, repoContext)
 
-func CreateRepositoryHandler(repoManager *repository.Manager) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Not implemented yet"))
-	}
-}
-
-func ListRepositoriesHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Not implemented yet"))
-	}
-}
-
-func GetRepositoryHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Not implemented yet"))
-	}
-}
-
-func DeleteRepositoryHandler(repoManager *repository.Manager) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Not implemented yet"))
-	}
-}
-
-func GetRepositoryPermissionsHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Not implemented yet"))
-	}
-}
-
-func AddRepositoryPermissionHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Not implemented yet"))
-	}
-}
-
-func UpdateRepositoryPermissionHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Not implemented yet"))
-	}
-}
-
-func RemoveRepositoryPermissionHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Not implemented yet"))
+			// Continue with the next handler
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
 	}
 }

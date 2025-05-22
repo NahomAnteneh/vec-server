@@ -15,6 +15,13 @@ const (
 	PktLenSize = 4
 	// FlushPkt is the special flush packet "0000"
 	FlushPkt = "0000"
+
+	// SideBandMain is the channel for packfile data
+	SideBandMain = 1
+	// SideBandProgress is the channel for progress information
+	SideBandProgress = 2
+	// SideBandError is the channel for error messages
+	SideBandError = 3
 )
 
 // Common errors
@@ -138,4 +145,67 @@ func WriteAllPacketLines(w io.Writer, packets [][]byte) error {
 	}
 
 	return WriteFlushPacket(w)
+}
+
+// EncodeSideBand encodes data for side-band transmission on the specified channel
+func EncodeSideBand(channel byte, data []byte) []byte {
+	result := make([]byte, len(data)+1)
+	result[0] = channel
+	copy(result[1:], data)
+	return result
+}
+
+// DecodeSideBand decodes side-band data and returns the channel and data
+func DecodeSideBand(data []byte) (byte, []byte, error) {
+	if len(data) < 1 {
+		return 0, nil, errors.New("invalid side-band data")
+	}
+
+	channel := data[0]
+	payload := data[1:]
+
+	return channel, payload, nil
+}
+
+// WriteSideBand writes data on the specified side-band channel
+func WriteSideBand(w io.Writer, channel byte, data []byte) error {
+	return WritePacketLine(w, EncodeSideBand(channel, data))
+}
+
+// ReadSideBand reads data from a side-band encoded packet
+func ReadSideBand(r io.Reader) (byte, []byte, bool, error) {
+	data, isFlush, err := ReadPacketLine(r)
+	if err != nil {
+		return 0, nil, isFlush, err
+	}
+
+	if isFlush {
+		return 0, nil, true, nil
+	}
+
+	channel, payload, err := DecodeSideBand(data)
+	if err != nil {
+		return 0, nil, false, err
+	}
+
+	return channel, payload, false, nil
+}
+
+// WriteDelimitedPacket writes a packet with null-terminated capabilities
+func WriteDelimitedPacket(w io.Writer, first string, capabilities string) error {
+	data := []byte(first)
+	if capabilities != "" {
+		data = append(data, 0) // Null delimiter
+		data = append(data, []byte(capabilities)...)
+	}
+	return WritePacketLine(w, data)
+}
+
+// ParseCapabilities parses capabilities from a want/have line
+func ParseCapabilities(line string) (string, string) {
+	parts := bytes.SplitN([]byte(line), []byte{0}, 2)
+	if len(parts) == 1 {
+		return string(parts[0]), ""
+	}
+	return string(parts[0]), string(parts[1])
 }

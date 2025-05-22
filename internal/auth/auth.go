@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -11,6 +12,20 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
+
+// contextKey is a custom type to avoid collisions in the context value map
+type contextKey string
+
+// AuthenticatedUserKey is the key used to store the authenticated user in the context
+const AuthenticatedUserKey contextKey = "authenticated_user"
+
+// GetUserFromContext retrieves the authenticated user from the context
+func GetUserFromContext(ctx context.Context) *models.User {
+	if user, ok := ctx.Value(AuthenticatedUserKey).(*models.User); ok {
+		return user
+	}
+	return nil
+}
 
 const (
 	// TokenExpiration defines how long a token remains valid

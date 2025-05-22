@@ -7,8 +7,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
 
-	"github.com/vec-server/internal/auth"
-	"github.com/vec-server/internal/db/models"
+	"github.com/NahomAnteneh/vec-server/internal/auth"
+	"github.com/NahomAnteneh/vec-server/internal/db/models"
 )
 
 // PermissionRequest represents the request format for adding/updating collaborator permissions

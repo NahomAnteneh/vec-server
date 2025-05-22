@@ -2,7 +2,7 @@ package packfile
 
 import (
 	"compress/zlib"
-	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -10,137 +10,7 @@ import (
 	"io"
 	"os"
 	"sort"
-
-	"github.com/NahomAnteneh/vec-server/internal/objects"
 )
-
-// Parser parses packfiles and extracts objects
-type Parser struct {
-	reader io.Reader
-}
-
-// NewParser creates a new packfile parser
-func NewParser(reader io.Reader) *Parser {
-	return &Parser{reader: reader}
-}
-
-// Parse parses the packfile and returns the objects
-func (p *Parser) Parse() ([]*objects.Object, error) {
-	// Read and verify header
-	header := make([]byte, 12)
-	if _, err := io.ReadFull(p.reader, header); err != nil {
-		return nil, fmt.Errorf("failed to read packfile header: %w", err)
-	}
-
-	// Check signature
-	if string(header[0:4]) != "PACK" {
-		return nil, errors.New("invalid packfile: bad signature")
-	}
-
-	// Check version
-	version := binary.BigEndian.Uint32(header[4:8])
-	if version != 2 {
-		return nil, fmt.Errorf("unsupported packfile version: %d", version)
-	}
-
-	// Get number of objects
-	numObjects := binary.BigEndian.Uint32(header[8:12])
-
-	// Parse objects
-	var result []*objects.Object
-	for i := uint32(0); i < numObjects; i++ {
-		obj, err := p.parseObject()
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse object %d: %w", i, err)
-		}
-		result = append(result, obj)
-	}
-
-	return result, nil
-}
-
-// parseObject parses a single object from the packfile
-func (p *Parser) parseObject() (*objects.Object, error) {
-	// Read object header (type and size)
-	objType, size, err := p.readObjectHeader()
-	if err != nil {
-		return nil, err
-	}
-
-	// Map packfile object type to Vec object type
-	var vecObjType objects.ObjectType
-	switch objType {
-	case 1:
-		vecObjType = objects.ObjectTypeCommit
-	case 2:
-		vecObjType = objects.ObjectTypeTree
-	case 3:
-		vecObjType = objects.ObjectTypeBlob
-	case 4:
-		vecObjType = objects.ObjectTypeTag
-	default:
-		return nil, fmt.Errorf("unsupported object type: %d", objType)
-	}
-
-	// Read compressed data
-	zlibReader, err := zlib.NewReader(p.reader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create zlib reader: %w", err)
-	}
-	defer zlibReader.Close()
-
-	// Read object data
-	data := make([]byte, size)
-	if _, err := io.ReadFull(zlibReader, data); err != nil {
-		return nil, fmt.Errorf("failed to read object data: %w", err)
-	}
-
-	// Create object
-	obj := &objects.Object{
-		Type:    vecObjType,
-		Content: data,
-	}
-
-	// Calculate hash
-	obj.Hash, err = objects.HashObject(data, vecObjType)
-	if err != nil {
-		return nil, fmt.Errorf("failed to calculate object hash: %w", err)
-	}
-
-	return obj, nil
-}
-
-// readObjectHeader reads the object type and size from the packfile
-func (p *Parser) readObjectHeader() (byte, uint64, error) {
-	// Read first byte
-	var firstByte [1]byte
-	if _, err := io.ReadFull(p.reader, firstByte[:]); err != nil {
-		return 0, 0, fmt.Errorf("failed to read object header: %w", err)
-	}
-
-	// Extract type and initial size
-	objType := (firstByte[0] >> 4) & 0x7
-	size := uint64(firstByte[0] & 0x0F)
-	shift := uint(4)
-
-	// Read variable-length size
-	for firstByte[0]&0x80 != 0 {
-		var b [1]byte
-		if _, err := io.ReadFull(p.reader, b[:]); err != nil {
-			return 0, 0, fmt.Errorf("failed to read object size: %w", err)
-		}
-
-		size |= uint64(b[0]&0x7F) << shift
-		shift += 7
-
-		// Check for continuation bit
-		if b[0]&0x80 == 0 {
-			break
-		}
-	}
-
-	return objType, size, nil
-}
 
 // ParsePackfile parses the binary packfile and returns a slice of objects.
 // Maintains backward compatibility with the original function.
@@ -498,16 +368,20 @@ func readPackObject(file *os.File) (*Object, error) {
 		shift += 7
 	}
 
+	// currentIsDelta removed as Object.IsDelta field is gone.
+	// Delta status is inferred from objectType.
 	var currentBaseHash string // Only populated for OBJ_REF_DELTA
 
 	if objectType == OBJ_REF_DELTA {
-		baseHashBytes := make([]byte, 20)
+		// currentIsDelta = true // No longer needed
+		baseHashBytes := make([]byte, 32) // SHA-256 is 32 bytes
 		_, err = io.ReadFull(file, baseHashBytes)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read base hash for REF_DELTA: %w", err)
 		}
 		currentBaseHash = fmt.Sprintf("%x", baseHashBytes)
 	} else if objectType == OBJ_OFS_DELTA {
+		// currentIsDelta = true // No longer needed
 		// Read the variable-length offset for OFS_DELTA
 		// Note: The actual offset value isn't stored in the Object struct's BaseHash.
 		// The caller (ParseModernPackfile) knows the base offset from its first pass.
@@ -578,6 +452,7 @@ func readByte(file *os.File) (byte, error) {
 }
 
 // calculateObjectHash calculates a hash for an object
+// This is a more complete implementation compared to the placeholder
 func calculateObjectHash(objType ObjectType, data []byte) string {
 	// Create the object header (e.g., "blob 12345\0")
 	var typeStr string
@@ -601,8 +476,8 @@ func calculateObjectHash(objType ObjectType, data []byte) string {
 
 	header := fmt.Sprintf("%s %d\x00", typeStr, len(data))
 
-	// Calculate SHA-1 hash of the entire content including header
-	h := sha1.New()
+	// Calculate SHA-256 hash of the entire content including header
+	h := sha256.New()
 	h.Write([]byte(header))
 	h.Write(data)
 

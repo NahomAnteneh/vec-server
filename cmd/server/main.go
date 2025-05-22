@@ -53,7 +53,7 @@ func main() {
 	repoManager := repository.NewManager(cfg)
 
 	// Create router
-	router := api.SetupRouter(cfg, repoManager)
+	router := api.SetupRouter(cfg, repoManager, database)
 
 	// Configure HTTP server with timeouts that match client expectations (60s default)
 	server := &http.Server{

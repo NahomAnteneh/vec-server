@@ -4,7 +4,7 @@ import "fmt"
 
 // Constants
 const (
-	hashLength = 40 // SHA-1 hash length in hex form (20 bytes represented as 40 hex characters)
+	hashLength = 64 // SHA-256 hash length in hex form (32 bytes represented as 64 hex characters)
 
 	// Object type bits in packed format
 	TYPE_OFS_DELTA = 6 // Delta with offset to base
@@ -38,6 +38,7 @@ type Object struct {
 
 	// For delta objects
 	BaseHash string // Hash of base object (if this is a delta)
+	// IsDelta bool // Field removed, infer from Type (OBJ_REF_DELTA, OBJ_OFS_DELTA)
 }
 
 // DeltaObject represents a delta object with a base object hash and delta instructions

@@ -40,16 +40,16 @@ func ReadPackIndex(indexPath string) (*PackfileIndex, error) {
 	numObjects := uint32(fanoutTable[255]) // Total number of objects from last fanout entry
 
 	// Prepare to read main tables
-	objectHashes := make([][]byte, numObjects) // Store raw SHA-1 byte slices
+	objectHashes := make([][]byte, numObjects) // Store raw SHA-256 byte slices
 	objectCRCs := make([]uint32, numObjects)
 	objectOffsets := make([]uint64, numObjects)
 	packIndexEntries := make(map[string]PackIndexEntry, numObjects)
 
-	// Read SHA-1 names (numObjects * 20 bytes/hash)
+	// Read SHA-256 names (numObjects * 32 bytes/hash)
 	for i := uint32(0); i < numObjects; i++ {
-		objectHashes[i] = make([]byte, 20)
+		objectHashes[i] = make([]byte, 32)
 		if _, err := io.ReadFull(file, objectHashes[i]); err != nil {
-			return nil, fmt.Errorf("failed to read SHA-1 #%d: %w", i, err)
+			return nil, fmt.Errorf("failed to read SHA-256 #%d: %w", i, err)
 		}
 	}
 
@@ -96,8 +96,8 @@ func ReadPackIndex(indexPath string) (*PackfileIndex, error) {
 			objectOffsets[i] = uint64(tempOffsets[i])
 		}
 
-		sha1Hex := fmt.Sprintf("%x", objectHashes[i])
-		packIndexEntries[sha1Hex] = PackIndexEntry{
+		hashHex := fmt.Sprintf("%x", objectHashes[i])
+		packIndexEntries[hashHex] = PackIndexEntry{
 			Offset: objectOffsets[i],
 			CRC32:  objectCRCs[i],
 			Type:   OBJ_NONE, // Type and Size are not in the index file; must be read from pack.
@@ -105,8 +105,8 @@ func ReadPackIndex(indexPath string) (*PackfileIndex, error) {
 		}
 	}
 
-	// Read packfile checksum (20 bytes at the end of the index, before index checksum)
-	packChecksum := make([]byte, 20)
+	// Read packfile checksum (32 bytes at the end of the index, before index checksum)
+	packChecksum := make([]byte, 32)
 	if _, err := io.ReadFull(file, packChecksum); err != nil {
 		// Check for EOF, as some simple index files might omit this or the index checksum
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -141,26 +141,26 @@ func WritePackIndex(index *PackfileIndex, indexPath string) error {
 		return fmt.Errorf("failed to write index header: %w", err)
 	}
 
-	// Prepare data for fanout table, SHA-1 table, and offset table
+	// Prepare data for fanout table, SHA-256 table, and offset table
 	numObjects := uint32(len(index.Entries))
 	fanout := make([]uint32, 256)
-	sha1s := make([]string, 0, numObjects)
+	hashes := make([]string, 0, numObjects)
 
-	// Collect all SHA-1 values
-	for sha1Hex := range index.Entries {
-		sha1s = append(sha1s, sha1Hex)
+	// Collect all SHA-256 values
+	for hashHex := range index.Entries {
+		hashes = append(hashes, hashHex)
 	}
 
-	// Sort SHA-1 values lexicographically
-	sortSHA1s(sha1s)
+	// Sort SHA-256 values lexicographically
+	sortHashes(hashes)
 
 	// Build fanout table - count how many objects start with each byte value
-	for _, sha1Hex := range sha1s {
+	for _, hashHex := range hashes {
 		// Convert first byte of hex string to byte value (two hex chars = one byte)
-		if len(sha1Hex) >= 2 {
-			val, err := strconv.ParseUint(sha1Hex[:2], 16, 8)
+		if len(hashHex) >= 2 {
+			val, err := strconv.ParseUint(hashHex[:2], 16, 8)
 			if err != nil {
-				return fmt.Errorf("invalid SHA-1 hex prefix %s: %w", sha1Hex[:2], err)
+				return fmt.Errorf("invalid SHA-256 hex prefix %s: %w", hashHex[:2], err)
 			}
 			firstByteVal := byte(val)
 
@@ -178,15 +178,15 @@ func WritePackIndex(index *PackfileIndex, indexPath string) error {
 		}
 	}
 
-	// Write SHA-1 table
-	for _, sha1Hex := range sha1s {
+	// Write SHA-256 table
+	for _, hashHex := range hashes {
 		// Convert hex string to bytes and write
-		sha1Bytes, err := hex.DecodeString(sha1Hex)
+		hashBytes, err := hex.DecodeString(hashHex)
 		if err != nil {
-			return fmt.Errorf("invalid SHA-1 hex string %s: %w", sha1Hex, err)
+			return fmt.Errorf("invalid SHA-256 hex string %s: %w", hashHex, err)
 		}
-		if _, err := file.Write(sha1Bytes); err != nil {
-			return fmt.Errorf("failed to write SHA-1: %w", err)
+		if _, err := file.Write(hashBytes); err != nil {
+			return fmt.Errorf("failed to write SHA-256: %w", err)
 		}
 	}
 
@@ -197,8 +197,8 @@ func WritePackIndex(index *PackfileIndex, indexPath string) error {
 	}
 
 	// Write offset table
-	for _, sha1Hex := range sha1s {
-		entry := index.Entries[sha1Hex]
+	for _, hashHex := range hashes {
+		entry := index.Entries[hashHex]
 
 		// Check if we need a large offset
 		if entry.Offset < (1 << 31) {
@@ -263,7 +263,7 @@ func VerifyPackIndex(indexPath, packfilePath string) error {
 	return nil
 }
 
-// sortSHA1s sorts SHA-1 hex strings in ascending order
-func sortSHA1s(sha1s []string) {
-	sort.Strings(sha1s)
+// sortHashes sorts SHA-256 hex strings in ascending order
+func sortHashes(hashes []string) {
+	sort.Strings(hashes)
 }

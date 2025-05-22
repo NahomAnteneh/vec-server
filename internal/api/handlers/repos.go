@@ -3,13 +3,14 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
 
-	"github.com/vec-server/internal/auth"
-	"github.com/vec-server/internal/db/models"
+	"github.com/NahomAnteneh/vec-server/internal/auth"
+	"github.com/NahomAnteneh/vec-server/internal/db/models"
 )
 
 // RepoResponse represents the response format for repository operations
@@ -59,6 +60,7 @@ func CreateRepository(repoService *models.RepositoryService) http.HandlerFunc {
 			Name:     req.Name,
 			OwnerID:  user.ID,
 			IsPublic: !req.Private,
+			Path:     filepath.Join("repos", user.Username, req.Name),
 		}
 
 		if err := repoService.Create(repo); err != nil {
