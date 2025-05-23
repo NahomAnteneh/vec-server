@@ -3,7 +3,6 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
-	"path/filepath"
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
@@ -19,7 +18,7 @@ type RepoResponse struct {
 	Name        string `json:"name"`
 	Owner       string `json:"owner"`
 	OwnerID     uint   `json:"owner_id"`
-	Description string `json:"description,omitempty"` // May be added to repository model later
+	Description string `json:"description,omitempty"`
 	Private     bool   `json:"private"`
 	CreatedAt   string `json:"created_at"`
 	UpdatedAt   string `json:"updated_at,omitempty"`
@@ -33,34 +32,29 @@ type RepoRequest struct {
 }
 
 // CreateRepository handles the creation of a new repository
-func CreateRepository(repoService *models.RepositoryService) http.HandlerFunc {
+func CreateRepository(repoService models.RepositoryService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Get authenticated user
 		user := auth.GetUserFromContext(r.Context())
 		if user == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
-		// Parse request body
 		var req RepoRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request payload", http.StatusBadRequest)
 			return
 		}
 
-		// Validate required fields
 		if req.Name == "" {
 			http.Error(w, "Repository name is required", http.StatusBadRequest)
 			return
 		}
 
-		// Create repository
 		repo := &models.Repository{
 			Name:     req.Name,
 			OwnerID:  user.ID,
 			IsPublic: !req.Private,
-			Path:     filepath.Join("repos", user.Username, req.Name),
 		}
 
 		if err := repoService.Create(repo); err != nil {
@@ -68,7 +62,6 @@ func CreateRepository(repoService *models.RepositoryService) http.HandlerFunc {
 			return
 		}
 
-		// Return response
 		render.Status(r, http.StatusCreated)
 		render.JSON(w, r, RepoResponse{
 			ID:        repo.ID,
@@ -82,20 +75,17 @@ func CreateRepository(repoService *models.RepositoryService) http.HandlerFunc {
 }
 
 // GetRepository retrieves repository metadata
-func GetRepository(repoService *models.RepositoryService) http.HandlerFunc {
+func GetRepository(repoService models.RepositoryService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Get repository name from URL
-		repoName := chi.URLParam(r, "repoName")
+		repoName := chi.URLParam(r, "repo")
 		username := chi.URLParam(r, "username")
 
-		// Get repository
 		repo, err := repoService.GetByUsername(username, repoName)
 		if err != nil {
 			http.Error(w, "Repository not found", http.StatusNotFound)
 			return
 		}
 
-		// Check permissions if repository is private
 		if !repo.IsPublic {
 			user := auth.GetUserFromContext(r.Context())
 			if user == nil {
@@ -103,7 +93,8 @@ func GetRepository(repoService *models.RepositoryService) http.HandlerFunc {
 				return
 			}
 			if user.ID != repo.OwnerID {
-				hasAccess, _ := hasRepoAccess(r, repo.ID, user.ID)
+				permService := r.Context().Value("permissionService").(models.PermissionService)
+				hasAccess, _ := permService.HasPermission(user.ID, repo.ID, models.ReadPermission)
 				if !hasAccess {
 					http.Error(w, "Unauthorized", http.StatusUnauthorized)
 					return
@@ -111,7 +102,6 @@ func GetRepository(repoService *models.RepositoryService) http.HandlerFunc {
 			}
 		}
 
-		// Return repository data
 		render.JSON(w, r, RepoResponse{
 			ID:        repo.ID,
 			Name:      repo.Name,
@@ -125,43 +115,38 @@ func GetRepository(repoService *models.RepositoryService) http.HandlerFunc {
 }
 
 // UpdateRepository updates repository settings
-func UpdateRepository(repoService *models.RepositoryService) http.HandlerFunc {
+func UpdateRepository(repoService models.RepositoryService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Get authenticated user
 		user := auth.GetUserFromContext(r.Context())
 		if user == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
-		// Get repository ID from URL
-		repoName := chi.URLParam(r, "repoName")
+		repoName := chi.URLParam(r, "repo")
 		username := chi.URLParam(r, "username")
 
-		// Get repository
 		repo, err := repoService.GetByUsername(username, repoName)
 		if err != nil {
 			http.Error(w, "Repository not found", http.StatusNotFound)
 			return
 		}
 
-		// Check if user has admin permissions
 		if user.ID != repo.OwnerID {
-			hasAdmin, _ := hasAdminPermission(r, repo.ID, user.ID)
+			permService := r.Context().Value("permissionService").(models.PermissionService)
+			hasAdmin, _ := permService.HasPermission(user.ID, repo.ID, models.AdminPermission)
 			if !hasAdmin {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
 		}
 
-		// Parse request body
 		var req RepoRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request payload", http.StatusBadRequest)
 			return
 		}
 
-		// Update repository
 		if req.Name != "" && req.Name != repo.Name {
 			repo.Name = req.Name
 		}
@@ -172,7 +157,6 @@ func UpdateRepository(repoService *models.RepositoryService) http.HandlerFunc {
 			return
 		}
 
-		// Return updated repository data
 		render.JSON(w, r, RepoResponse{
 			ID:        repo.ID,
 			Name:      repo.Name,
@@ -186,59 +170,51 @@ func UpdateRepository(repoService *models.RepositoryService) http.HandlerFunc {
 }
 
 // DeleteRepository deletes a repository
-func DeleteRepository(repoService *models.RepositoryService) http.HandlerFunc {
+func DeleteRepository(repoService models.RepositoryService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Get authenticated user
 		user := auth.GetUserFromContext(r.Context())
 		if user == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
-		// Get repository ID from URL
-		repoName := chi.URLParam(r, "repoName")
+		repoName := chi.URLParam(r, "repo")
 		username := chi.URLParam(r, "username")
 
-		// Get repository
 		repo, err := repoService.GetByUsername(username, repoName)
 		if err != nil {
 			http.Error(w, "Repository not found", http.StatusNotFound)
 			return
 		}
 
-		// Only the owner can delete a repository
 		if user.ID != repo.OwnerID {
 			http.Error(w, "Only repository owner can delete the repository", http.StatusForbidden)
 			return
 		}
 
-		// Delete repository
 		if err := repoService.Delete(repo.ID); err != nil {
 			http.Error(w, "Failed to delete repository: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// Return success with no content
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
 // ListUserRepositories lists repositories for a user
-func ListUserRepositories(repoService *models.RepositoryService) http.HandlerFunc {
+func ListUserRepositories(repoService models.RepositoryService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		username := chi.URLParam(r, "username")
 
-		// Get user ID
-		userService := r.Context().Value("userService").(*models.UserService)
+		userService := r.Context().Value("userService").(models.UserService)
 		targetUser, err := userService.GetByUsername(username)
 		if err != nil {
 			http.Error(w, "User not found", http.StatusNotFound)
 			return
 		}
 
-		// Parse pagination parameters
-		limit := 20 // Default limit
-		offset := 0 // Default offset
+		limit := 20
+		offset := 0
 
 		limitParam := r.URL.Query().Get("limit")
 		if limitParam != "" {
@@ -256,20 +232,16 @@ func ListUserRepositories(repoService *models.RepositoryService) http.HandlerFun
 			}
 		}
 
-		// Get authenticated user for private repo access
 		currentUser := auth.GetUserFromContext(r.Context())
 
-		// Get repositories
 		repos, err := repoService.ListByOwner(targetUser.ID, limit, offset)
 		if err != nil {
 			http.Error(w, "Failed to list repositories: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// Filter out private repositories if the user is not the owner
 		var filteredRepos []RepoResponse
 		for _, repo := range repos {
-			// Include repository if it's public or if the current user is the owner
 			if repo.IsPublic || (currentUser != nil && currentUser.ID == repo.OwnerID) {
 				filteredRepos = append(filteredRepos, RepoResponse{
 					ID:        repo.ID,
@@ -282,7 +254,6 @@ func ListUserRepositories(repoService *models.RepositoryService) http.HandlerFun
 			}
 		}
 
-		// Return paginated result
 		render.JSON(w, r, map[string]interface{}{
 			"repositories": filteredRepos,
 			"next_cursor":  offset + len(filteredRepos),
@@ -291,36 +262,32 @@ func ListUserRepositories(repoService *models.RepositoryService) http.HandlerFun
 }
 
 // ForkRepository creates a fork of an existing repository
-func ForkRepository(repoService *models.RepositoryService) http.HandlerFunc {
+func ForkRepository(repoService models.RepositoryService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Get authenticated user
 		user := auth.GetUserFromContext(r.Context())
 		if user == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
-		// Get repository ID from URL
-		repoName := chi.URLParam(r, "repoName")
+		repoName := chi.URLParam(r, "repo")
 		username := chi.URLParam(r, "username")
 
-		// Get source repository
 		sourceRepo, err := repoService.GetByUsername(username, repoName)
 		if err != nil {
 			http.Error(w, "Repository not found", http.StatusNotFound)
 			return
 		}
 
-		// Check if user has read access to the source repository
 		if !sourceRepo.IsPublic {
-			hasAccess, _ := hasRepoAccess(r, sourceRepo.ID, user.ID)
+			permService := r.Context().Value("permissionService").(models.PermissionService)
+			hasAccess, _ := permService.HasPermission(user.ID, sourceRepo.ID, models.ReadPermission)
 			if !hasAccess {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
 		}
 
-		// Create forked repository
 		forkedRepo := &models.Repository{
 			Name:     sourceRepo.Name,
 			OwnerID:  user.ID,
@@ -332,10 +299,13 @@ func ForkRepository(repoService *models.RepositoryService) http.HandlerFunc {
 			return
 		}
 
-		// TODO: Implement actual forking of repository files
-		// This would involve copying the actual repository data files
+		// TODO: Copy repository files using repoManager
+		// repoManager := r.Context().Value("repoManager").(*repository.Manager)
+		// if err := repoManager.CopyRepository(sourceRepo.Path, forkedRepo.Path); err != nil {
+		//     http.Error(w, "Failed to copy repository files: "+err.Error(), http.StatusInternalServerError)
+		//     return
+		// }
 
-		// Return response
 		render.Status(r, http.StatusCreated)
 		render.JSON(w, r, RepoResponse{
 			ID:        forkedRepo.ID,
@@ -346,18 +316,4 @@ func ForkRepository(repoService *models.RepositoryService) http.HandlerFunc {
 			CreatedAt: forkedRepo.CreatedAt.Format(http.TimeFormat),
 		})
 	}
-}
-
-// Helper functions
-
-// hasRepoAccess checks if a user has at least read access to a repository
-func hasRepoAccess(r *http.Request, repoID, userID uint) (bool, error) {
-	permissionService := r.Context().Value("permissionService").(*models.PermissionService)
-	return permissionService.HasPermission(userID, repoID, models.ReadPermission)
-}
-
-// hasAdminPermission checks if a user has admin access to a repository
-func hasAdminPermission(r *http.Request, repoID, userID uint) (bool, error) {
-	permissionService := r.Context().Value("permissionService").(*models.PermissionService)
-	return permissionService.HasPermission(userID, repoID, models.AdminPermission)
 }

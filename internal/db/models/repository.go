@@ -24,23 +24,23 @@ func (Repository) TableName() string {
 	return "repositories"
 }
 
-// RepositoryService provides methods for interacting with repositories in the database
-type RepositoryService struct {
+// RepositoryServiceImpl provides methods for interacting with repositories in the database
+type RepositoryServiceImpl struct {
 	db *gorm.DB
 }
 
-// NewRepositoryService creates a new repository service with the given database connection
-func NewRepositoryService(db *gorm.DB) *RepositoryService {
-	return &RepositoryService{db: db}
+// NewRepositoryService creates a new repository service
+func NewRepositoryService(db *gorm.DB) RepositoryService {
+	return &RepositoryServiceImpl{db: db}
 }
 
 // Create inserts a new repository into the database
-func (s *RepositoryService) Create(repo *Repository) error {
+func (s *RepositoryServiceImpl) Create(repo *Repository) error {
 	return s.db.Create(repo).Error
 }
 
 // GetByID retrieves a repository by its ID
-func (s *RepositoryService) GetByID(id uint) (*Repository, error) {
+func (s *RepositoryServiceImpl) GetByID(id uint) (*Repository, error) {
 	var repo Repository
 	err := s.db.Preload("Owner").First(&repo, id).Error
 	if err != nil {
@@ -52,21 +52,8 @@ func (s *RepositoryService) GetByID(id uint) (*Repository, error) {
 	return &repo, nil
 }
 
-// GetByOwnerAndName retrieves a repository by owner and name
-func (s *RepositoryService) GetByOwnerAndName(ownerID uint, name string) (*Repository, error) {
-	var repo Repository
-	err := s.db.Where("owner_id = ? AND name = ?", ownerID, name).Preload("Owner").First(&repo).Error
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, errors.New("repository not found")
-		}
-		return nil, err
-	}
-	return &repo, nil
-}
-
 // GetByUsername retrieves a repository by username and repository name
-func (s *RepositoryService) GetByUsername(username, repoName string) (*Repository, error) {
+func (s *RepositoryServiceImpl) GetByUsername(username, repoName string) (*Repository, error) {
 	var repo Repository
 	err := s.db.Joins("JOIN users ON users.id = repositories.owner_id").
 		Where("users.username = ? AND repositories.name = ?", username, repoName).
@@ -82,42 +69,19 @@ func (s *RepositoryService) GetByUsername(username, repoName string) (*Repositor
 }
 
 // Update updates an existing repository in the database
-func (s *RepositoryService) Update(repo *Repository) error {
+func (s *RepositoryServiceImpl) Update(repo *Repository) error {
 	return s.db.Save(repo).Error
 }
 
 // Delete removes a repository from the database
-func (s *RepositoryService) Delete(id uint) error {
+func (s *RepositoryServiceImpl) Delete(id uint) error {
 	return s.db.Delete(&Repository{}, id).Error
 }
 
-// ListByOwner retrieves all repositories for a given owner with pagination
-func (s *RepositoryService) ListByOwner(ownerID uint, limit, offset int) ([]*Repository, error) {
+// ListByOwner retrieves repositories for a given owner with pagination
+func (s *RepositoryServiceImpl) ListByOwner(ownerID uint, limit, offset int) ([]*Repository, error) {
 	var repos []*Repository
 	err := s.db.Where("owner_id = ?", ownerID).
-		Preload("Owner").
-		Limit(limit).
-		Offset(offset).
-		Order("name").
-		Find(&repos).Error
-	return repos, err
-}
-
-// ListAll retrieves all repositories with pagination
-func (s *RepositoryService) ListAll(limit, offset int) ([]*Repository, error) {
-	var repos []*Repository
-	err := s.db.Preload("Owner").
-		Limit(limit).
-		Offset(offset).
-		Order("name").
-		Find(&repos).Error
-	return repos, err
-}
-
-// ListPublic retrieves all public repositories with pagination
-func (s *RepositoryService) ListPublic(limit, offset int) ([]*Repository, error) {
-	var repos []*Repository
-	err := s.db.Where("is_public = ?", true).
 		Preload("Owner").
 		Limit(limit).
 		Offset(offset).

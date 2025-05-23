@@ -6,39 +6,53 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
+	"github.com/NahomAnteneh/vec-server/core"
 	"github.com/NahomAnteneh/vec-server/internal/config"
 	"github.com/NahomAnteneh/vec-server/internal/db/models"
 )
 
+// Errors for repository operations
 var (
-	// ErrRepoNotFound is returned when a repository does not exist
-	ErrRepoNotFound = errors.New("repository not found")
-	// ErrRepoAlreadyExists is returned when creating a repository that already exists
+	ErrRepoNotFound      = errors.New("repository not found")
 	ErrRepoAlreadyExists = errors.New("repository already exists")
-
-	// repoLocks provides mutex locks for each repository to prevent concurrent modifications
-	repoLocks = &sync.Map{}
+	ErrInvalidRepoName   = errors.New("invalid repository name")
 )
+
+// repoLocks provides mutex locks for each repository to prevent concurrent modifications
+var repoLocks = &sync.Map{}
 
 // Manager handles filesystem operations for repositories
 type Manager struct {
-	cfg    *config.Config
-	fs     *FS
-	refMgr *RefManager
+	cfg         *config.Config
+	fs          *FS
+	refMgr      *RefManager
+	logger      *log.Logger
+	syncManager *SyncManager
 }
 
 // NewManager creates a new repository manager
-func NewManager(cfg *config.Config) *Manager {
+func NewManager(cfg *config.Config, logger *log.Logger) *Manager {
 	fs := NewFS()
 	refMgr := NewRefManager(fs)
-
 	return &Manager{
 		cfg:    cfg,
 		fs:     fs,
 		refMgr: refMgr,
+		logger: logger,
 	}
+}
+
+// SetSyncManager sets the sync manager for database operations
+func (m *Manager) SetSyncManager(syncManager *SyncManager) {
+	m.syncManager = syncManager
+}
+
+// GetSyncManager returns the sync manager for database operations
+func (m *Manager) GetSyncManager() *SyncManager {
+	return m.syncManager
 }
 
 // LockRepo acquires a lock for a repository
@@ -50,284 +64,351 @@ func (m *Manager) LockRepo(repoPath string) func() {
 }
 
 // GetRepoPath returns the filesystem path for a repository
-func (m *Manager) GetRepoPath(ownerOrRepo interface{}, repoName ...string) string {
-	// If passed a repository object
-	if repo, ok := ownerOrRepo.(*models.Repository); ok {
-		return repo.Path
+func (m *Manager) GetRepoPath(ownerOrRepo interface{}, repoName ...string) (string, error) {
+	var owner, repo string
+	if repoObj, ok := ownerOrRepo.(*models.Repository); ok {
+		return repoObj.Path, nil
+	} else if ownerStr, ok := ownerOrRepo.(string); ok && len(repoName) > 0 {
+		owner = ownerStr
+		repo = repoName[0]
+	} else {
+		return "", fmt.Errorf("invalid owner or repository name")
 	}
 
-	// If passed owner and repo name strings
-	if owner, ok := ownerOrRepo.(string); ok && len(repoName) > 0 {
-		// Don't append .vec extension - use the repo name as is
-		return filepath.Join(m.cfg.RepoBasePath, owner, repoName[0])
+	// Validate owner and repo name
+	if owner == "" || strings.ContainsAny(owner, "/\\:") || strings.Contains(owner, "..") {
+		return "", fmt.Errorf("invalid owner: %s", owner)
+	}
+	if repo == "" || strings.ContainsAny(repo, "/\\:") || strings.Contains(repo, "..") {
+		return "", ErrInvalidRepoName
 	}
 
-	// Default case (should not happen)
-	return ""
+	path := filepath.Join(m.cfg.RepoBasePath, owner, repo)
+	if err := m.fs.ValidatePath(m.cfg.RepoBasePath, filepath.Join(owner, repo)); err != nil {
+		return "", fmt.Errorf("invalid repository path: %w", err)
+	}
+	return path, nil
 }
 
 // RepositoryExists checks if a repository exists
-func (m *Manager) RepositoryExists(owner, repoName string) bool {
-	repoPath := m.GetRepoPath(owner, repoName)
-	log.Printf("RepositoryExists: Checking existence of repo at path: %s", repoPath)
-	return m.RepoExists(repoPath)
+func (m *Manager) RepositoryExists(owner, repoName string) (bool, error) {
+	repoPath, err := m.GetRepoPath(owner, repoName)
+	if err != nil {
+		return false, err
+	}
+	m.logger.Printf("Checking existence of repo at path: %s", repoPath)
+	return m.RepoExists(repoPath), nil
 }
 
 // RepoExists checks if a repository exists at the given path
 func (m *Manager) RepoExists(path string) bool {
-	// Check if .vec directory exists
 	vecDir := filepath.Join(path, ".vec")
 	info, err := os.Stat(vecDir)
-	log.Printf("RepoExists: Checking .vec directory at: %s, err: %v", vecDir, err)
 	if err != nil {
+		m.logger.Printf("RepoExists: No .vec directory at %s: %v", vecDir, err)
 		return false
 	}
-	isDir := info.IsDir()
-	log.Printf("RepoExists: .vec directory exists and isDir: %v", isDir)
-	return isDir
+	return info.IsDir()
 }
 
-// CreateRepo creates a new bare repository
-func (m *Manager) CreateRepo(owner *models.User, repoName string) (string, error) {
-	// Generate repository path using owner's username and repository name
-	ownerPath := filepath.Join(m.cfg.RepoBasePath, owner.Username)
-	repoPath := filepath.Join(ownerPath, repoName+".vec")
+// createRepoStructure sets up the repository structure
+func (m *Manager) createRepoStructure(repo *models.Repository) error {
+	vecDir := filepath.Join(repo.Path, ".vec")
 
-	// Check if repository directory already exists
-	if _, err := os.Stat(repoPath); err == nil {
-		return "", ErrRepoAlreadyExists
-	}
-
-	// Create owner directory if it doesn't exist
-	if err := m.fs.CreateDirectory(ownerPath, 0755); err != nil {
-		return "", fmt.Errorf("failed to create owner directory: %w", err)
-	}
-
-	// Initialize bare repository
-	if err := m.fs.CreateDirectory(repoPath, 0755); err != nil {
-		return "", fmt.Errorf("failed to create repository directory: %w", err)
-	}
-
-	// Create .vec directory
-	vecDir := filepath.Join(repoPath, ".vec")
-	if err := m.fs.CreateDirectory(vecDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create .vec directory: %w", err)
-	}
-
-	// Create basic repository structure
-	dirs := []string{
+	// Create subdirectories
+	subDirs := []string{
 		filepath.Join(vecDir, "objects"),
+		filepath.Join(vecDir, "objects", "pack"),
+		filepath.Join(vecDir, "objects", "info"),
 		filepath.Join(vecDir, "refs", "heads"),
-		filepath.Join(vecDir, "refs", "tags"),
+		filepath.Join(vecDir, "refs", "remotes"),
+		filepath.Join(vecDir, "logs", "refs", "heads"),
+		filepath.Join(vecDir, "logs"),
 	}
 
-	for _, dir := range dirs {
-		if err := m.fs.CreateDirectory(dir, 0755); err != nil {
-			return "", fmt.Errorf("failed to create directory %s: %w", dir, err)
+	for _, subDir := range subDirs {
+		if err := m.fs.CreateDirectory(subDir, 0755); err != nil {
+			return fmt.Errorf("failed to create subdirectory %s: %w", subDir, err)
 		}
 	}
 
-	// Create a Repository model for reference operations
-	repo := &models.Repository{
-		Path: repoPath,
+	// Create common files
+	files := map[string]string{
+		filepath.Join(vecDir, "objects", "info", "packs"):      "",
+		filepath.Join(vecDir, "objects", "info", "alternates"): "",
+		filepath.Join(vecDir, "HEAD"):                          "ref: refs/heads/main\n",
+		filepath.Join(vecDir, "logs", "HEAD"):                  "",
+		filepath.Join(vecDir, "refs", "heads", "main"):         "",
 	}
 
-	// Create HEAD file pointing to main branch (using RefManager)
-	if err := m.refMgr.CreateRef(repo, "HEAD", "refs/heads/main", true); err != nil {
-		return "", fmt.Errorf("failed to create HEAD reference: %w", err)
+	for file, content := range files {
+		if err := m.fs.AtomicWriteFile(file, []byte(content), 0644); err != nil {
+			return fmt.Errorf("failed to create file %s: %w", file, err)
+		}
 	}
 
 	// Create config file
 	configFile := filepath.Join(vecDir, "config")
-	configContent := []byte("[core]\n\tbare = true\n")
-	if err := m.fs.CreateFile(configFile, configContent, 0644); err != nil {
-		return "", fmt.Errorf("failed to create config file: %w", err)
+	config := "[core]\n\tbare = true\n"
+	if err := m.fs.AtomicWriteFile(configFile, []byte(config), 0644); err != nil {
+		return fmt.Errorf("failed to create config file: %w", err)
 	}
 
+	return nil
+}
+
+// CreateRepo creates a new bare repository
+func (m *Manager) CreateRepo(owner *models.User, repoName string) (string, error) {
+	if owner == nil || owner.Username == "" {
+		return "", fmt.Errorf("invalid owner: username cannot be empty")
+	}
+	if repoName == "" || strings.ContainsAny(repoName, "/\\:") || strings.Contains(repoName, "..") {
+		return "", ErrInvalidRepoName
+	}
+
+	repoPath, err := m.GetRepoPath(owner.Username, repoName)
+	if err != nil {
+		return "", err
+	}
+
+	unlock := m.LockRepo(repoPath)
+	defer unlock()
+
+	if m.RepoExists(repoPath) {
+		return "", ErrRepoAlreadyExists
+	}
+
+	ownerPath := filepath.Dir(repoPath)
+	if err := m.fs.CreateDirectory(ownerPath, 0755); err != nil {
+		return "", fmt.Errorf("failed to create owner directory %s: %w", ownerPath, err)
+	}
+
+	if err := m.fs.CreateDirectory(repoPath, 0755); err != nil {
+		return "", fmt.Errorf("directory %s is not empty", repoPath)
+	}
+
+	// Create .vec directory and structure
+	if err := m.fs.CreateDirectory(filepath.Join(repoPath, ".vec"), 0755); err != nil {
+		return "", fmt.Errorf("failed to create .vec directory: %w", err)
+	}
+
+	if err := m.createRepoStructure(&models.Repository{Path: repoPath}); err != nil {
+		return "", err
+	}
+
+	m.logger.Printf("Initialized empty bare Vec repository in %s", repoPath)
 	return repoPath, nil
 }
 
 // DeleteRepo deletes a repository
 func (m *Manager) DeleteRepo(repo *models.Repository) error {
-	// Acquire lock for this repo
+	if repo == nil || repo.Path == "" {
+		return fmt.Errorf("invalid repository")
+	}
+
 	unlock := m.LockRepo(repo.Path)
 	defer unlock()
+	defer repoLocks.Delete(repo.Path)
 
-	// Check if repository exists
 	if !m.RepoExists(repo.Path) {
 		return ErrRepoNotFound
 	}
 
-	// Delete the repository directory using FS
 	if err := m.fs.DeleteDirectory(repo.Path); err != nil {
-		return fmt.Errorf("failed to delete repository: %w", err)
+		return fmt.Errorf("failed to delete repository %s: %w", repo.Path, err)
 	}
 
+	m.logger.Printf("Deleted repository %s", repo.Path)
 	return nil
 }
 
 // GetRefs returns a list of all references in a repository
 func (m *Manager) GetRefs(repo *models.Repository) (map[string]string, error) {
-	refs := make(map[string]string)
+	if repo == nil || repo.Path == "" {
+		return nil, fmt.Errorf("invalid repository")
+	}
 
-	// Use RefManager to list all references
-	allRefs, err := m.refMgr.ListRefs(repo, "")
+	refs, err := m.refMgr.ListRefs(repo, "")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to list references for repo %s: %w", repo.Path, err)
 	}
 
-	// Convert Reference objects to map
-	for _, ref := range allRefs {
-		refs[ref.Name] = ref.Value
+	result := make(map[string]string)
+	for _, ref := range refs {
+		result[ref.Name] = ref.Value
 	}
+	return result, nil
+}
 
-	return refs, nil
+// GetRef retrieves a specific reference for a repository
+func (m *Manager) GetRef(repo *models.Repository, refName string) (*Reference, error) {
+	if repo == nil || repo.Path == "" {
+		return nil, fmt.Errorf("invalid repository")
+	}
+	if refName == "" {
+		return nil, fmt.Errorf("invalid reference name")
+	}
+	return m.refMgr.GetRef(repo, refName)
+}
+
+// RunTransaction runs a reference transaction for a repository
+func (m *Manager) RunTransaction(repo *models.Repository, fn TransactionFunc) error {
+	if repo == nil || repo.Path == "" {
+		return fmt.Errorf("invalid repository")
+	}
+	return m.refMgr.RunTransaction(repo, fn)
 }
 
 // CreateBranch creates a new branch in a repository
 func (m *Manager) CreateBranch(repo *models.Repository, branchName, targetCommit string) error {
-	// Validate branch name
-	if branchName == "" {
-		return fmt.Errorf("branch name cannot be empty")
+	if repo == nil || repo.Path == "" {
+		return fmt.Errorf("invalid repository")
+	}
+	if branchName == "" || strings.ContainsAny(branchName, "/\\:") || strings.Contains(branchName, "..") {
+		return fmt.Errorf("invalid branch name: %s", branchName)
+	}
+	if !isValidCommitHash(targetCommit) {
+		return fmt.Errorf("invalid commit hash: %s", targetCommit)
 	}
 
-	// Create the branch reference (non-symbolic)
 	branchRef := fmt.Sprintf("refs/heads/%s", branchName)
+	m.logger.Printf("Creating branch %s in repo %s", branchRef, repo.Path)
 	return m.refMgr.CreateRef(repo, branchRef, targetCommit, false)
 }
 
 // DeleteBranch deletes a branch from a repository
 func (m *Manager) DeleteBranch(repo *models.Repository, branchName string) error {
-	// Validate branch name
-	if branchName == "" {
-		return fmt.Errorf("branch name cannot be empty")
+	if repo == nil || repo.Path == "" {
+		return fmt.Errorf("invalid repository")
+	}
+	if branchName == "" || strings.ContainsAny(branchName, "/\\:") ||
+
+		strings.Contains(branchName, "..") {
+		return fmt.Errorf("invalid branch name: %s", branchName)
 	}
 
-	// Format the branch reference name
 	branchRef := fmt.Sprintf("refs/heads/%s", branchName)
-
-	// Check if it's the current branch
 	headRef, err := m.refMgr.GetRef(repo, "HEAD")
 	if err == nil && headRef.Symbolic && headRef.Value == branchRef {
-		return fmt.Errorf("cannot delete the current branch")
+		return fmt.Errorf("cannot delete the current branch: %s", branchName)
 	}
 
-	// Delete the branch reference
+	m.logger.Printf("Deleting branch %s in repo %s", branchRef, repo.Path)
 	return m.refMgr.DeleteRef(repo, branchRef)
 }
 
 // CreateTag creates a new tag in a repository
 func (m *Manager) CreateTag(repo *models.Repository, tagName, targetCommit string) error {
-	// Validate tag name
-	if tagName == "" {
-		return fmt.Errorf("tag name cannot be empty")
+	if repo == nil || repo.Path == "" {
+		return fmt.Errorf("invalid repository")
+	}
+	if tagName == "" || strings.ContainsAny(tagName, "/\\:") || strings.Contains(tagName, "..") {
+		return fmt.Errorf("invalid tag name: %s", tagName)
+	}
+	if !isValidCommitHash(targetCommit) {
+		return fmt.Errorf("invalid commit hash: %s", targetCommit)
 	}
 
-	// Create the tag reference (non-symbolic)
 	tagRef := fmt.Sprintf("refs/tags/%s", tagName)
+	m.logger.Printf("Creating tag %s in repo %s", tagRef, repo.Path)
 	return m.refMgr.CreateRef(repo, tagRef, targetCommit, false)
 }
 
 // DeleteTag deletes a tag from a repository
 func (m *Manager) DeleteTag(repo *models.Repository, tagName string) error {
-	// Validate tag name
-	if tagName == "" {
-		return fmt.Errorf("tag name cannot be empty")
+	if repo == nil || repo.Path == "" {
+		return fmt.Errorf("invalid repository")
+	}
+	if tagName == "" || strings.ContainsAny(tagName, "/\\:") || strings.Contains(tagName, "..") {
+		return fmt.Errorf("invalid tag name: %s", tagName)
 	}
 
-	// Format the tag reference name
 	tagRef := fmt.Sprintf("refs/tags/%s", tagName)
-
-	// Delete the tag reference
+	m.logger.Printf("Deleting tag %s in repo %s", tagRef, repo.Path)
 	return m.refMgr.DeleteRef(repo, tagRef)
 }
 
 // UpdateHead updates the HEAD reference to point to a different branch
 func (m *Manager) UpdateHead(repo *models.Repository, branchName string) error {
-	// Format the branch reference name
-	branchRef := fmt.Sprintf("refs/heads/%s", branchName)
+	if repo == nil || repo.Path == "" {
+		return fmt.Errorf("invalid repository")
+	}
+	if branchName == "" || strings.ContainsAny(branchName, "/\\:") || strings.Contains(branchName, "..") {
+		return fmt.Errorf("invalid branch name: %s", branchName)
+	}
 
-	// Check if the branch exists
-	_, err := m.refMgr.GetRef(repo, branchRef)
-	if err != nil {
+	branchRef := fmt.Sprintf("refs/heads/%s", branchName)
+	if _, err := m.refMgr.GetRef(repo, branchRef); err != nil {
 		return fmt.Errorf("branch %s does not exist: %w", branchName, err)
 	}
 
-	// Update HEAD to point to the new branch
+	m.logger.Printf("Updating HEAD to %s in repo %s", branchRef, repo.Path)
 	return m.refMgr.CreateRef(repo, "HEAD", branchRef, true)
 }
 
 // SyncRepository ensures that a repository exists on disk
-// If the repository doesn't exist, it creates the basic structure
 func (m *Manager) SyncRepository(repo *models.Repository, ownerUser *models.User) error {
-	// Check if repository exists on disk
-	if m.RepoExists(repo.Path) {
-		return nil // Repository already exists
+	if repo == nil || repo.Path == "" || ownerUser == nil || ownerUser.Username == "" {
+		return fmt.Errorf("invalid repository or owner")
 	}
 
-	// Repository doesn't exist, create the basic structure
-	// Create owner directory if needed
-	ownerDir := filepath.Dir(repo.Path)
-	if err := m.fs.CreateDirectory(ownerDir, 0755); err != nil {
-		return fmt.Errorf("failed to create owner directory: %w", err)
-	}
-
-	// Create repository directory
-	if err := m.fs.CreateDirectory(repo.Path, 0755); err != nil {
-		return fmt.Errorf("failed to create repository directory: %w", err)
-	}
-
-	// Create .vec directory
-	vecDir := filepath.Join(repo.Path, ".vec")
-	if err := m.fs.CreateDirectory(vecDir, 0755); err != nil {
-		return fmt.Errorf("failed to create .vec directory: %w", err)
-	}
-
-	// Create basic repository structure
-	dirs := []string{
-		filepath.Join(vecDir, "objects"),
-		filepath.Join(vecDir, "objects", "info"),
-		filepath.Join(vecDir, "objects", "pack"),
-		filepath.Join(vecDir, "refs", "heads"),
-		filepath.Join(vecDir, "refs", "tags"),
-		filepath.Join(vecDir, "logs"),
-		filepath.Join(vecDir, "logs", "refs", "heads"),
-	}
-
-	for _, dir := range dirs {
-		if err := m.fs.CreateDirectory(dir, 0755); err != nil {
-			return fmt.Errorf("failed to create directory %s: %w", dir, err)
+	// Ensure repository exists on disk
+	if !m.RepoExists(repo.Path) {
+		m.logger.Printf("Syncing repository %s for owner %s", repo.Path, ownerUser.Username)
+		if err := m.createRepoStructure(repo); err != nil {
+			return err
 		}
 	}
 
-	// Create empty files
-	emptyFiles := []string{
-		filepath.Join(vecDir, "objects", "info", "alternates"),
-		filepath.Join(vecDir, "objects", "info", "packs"),
-	}
-
-	for _, file := range emptyFiles {
-		if err := m.fs.CreateFile(file, []byte{}, 0644); err != nil {
-			return fmt.Errorf("failed to create file %s: %w", file, err)
+	// If we have a sync manager, use it to sync database records
+	if m.syncManager != nil {
+		// Make sure the repository has its ID set for database operations
+		if repo.ID == 0 {
+			m.logger.Printf("Repository ID not set, looking up in database")
+			repoService := m.syncManager.repoService
+			dbRepo, err := repoService.GetByUsername(ownerUser.Username, repo.Name)
+			if err != nil {
+				return fmt.Errorf("failed to find repository in database: %w", err)
+			}
+			repo.ID = dbRepo.ID
 		}
-	}
 
-	// Create HEAD file pointing to main branch
-	headPath := filepath.Join(vecDir, "HEAD")
-	headContent := []byte("ref: refs/heads/main\n")
-	if err := m.fs.CreateFile(headPath, headContent, 0644); err != nil {
-		return fmt.Errorf("failed to create HEAD file: %w", err)
+		m.logger.Printf("Syncing repository metadata to database for %s (ID: %d)", repo.Path, repo.ID)
+		return m.syncManager.SyncRepository(repo)
 	}
-
-	// Create config file
-	configFile := filepath.Join(vecDir, "config")
-	configContent := []byte("[core]\n\tbare = true\n")
-	if err := m.fs.CreateFile(configFile, configContent, 0644); err != nil {
-		return fmt.Errorf("failed to create config file: %w", err)
-	}
-
-	// Instead of creating refs with all zeros, we'll leave it empty
-	// InfoRefsHandler will return an empty refs map, which is valid for an empty repository
 
 	return nil
+}
+
+// isValidCommitHash checks if a string is a valid SHA-1 or SHA-256 hash
+func isValidCommitHash(hash string) bool {
+	if len(hash) != 40 && len(hash) != 64 {
+		return false
+	}
+	for _, c := range hash {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// ReadObject reads an object from the repository
+func (m *Manager) ReadObject(repo *models.Repository, hash string) (string, []byte, error) {
+	if repo == nil || repo.Path == "" {
+		return "", nil, fmt.Errorf("invalid repository")
+	}
+	if hash == "" || !isValidCommitHash(hash) {
+		return "", nil, fmt.Errorf("invalid object hash: %s", hash)
+	}
+
+	m.logger.Printf("Reading object %s from repo %s", hash, repo.Path)
+
+	// Use core.ReadObject to read the object
+	objectType, data, err := core.ReadObject(repo.Path, hash)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to read object %s: %w", hash, err)
+	}
+
+	return objectType, data, nil
 }

@@ -1,0 +1,79 @@
+# Repository Server Configuration
+
+# Server settings
+server:
+  port: 8080
+  host: 0.0.0.0
+  read_timeout: 60s
+  write_timeout: 60s
+  idle_timeout: 120s
+  shutdown_timeout: 30s
+  max_request_size: 50MB
+
+# TLS configuration
+tls:
+  enabled: false
+  cert_path: "/path/to/cert.pem"
+  key_path: "/path/to/key.pem"
+
+# Repository settings
+repository:
+  # Base path where repositories are stored
+  base_path: "/data/repositories"
+  # Default permissions for new repository directories
+  dir_perms: 0755
+  # Repository size limits
+  max_size: 10GB
+  # Object storage limits
+  max_object_size: 100MB
+
+# Database configuration for authentication and permissions
+database:
+  url: "postgres://username:password@localhost:5432/vecserver?sslmode=disable"
+  max_open_conns: 25
+  max_idle_conns: 25
+  conn_max_lifetime: 5m
+
+# Authentication settings
+auth:
+  # JWT token verification settings
+  jwt_secret: "change-this-to-a-secure-secret-key"
+  token_expiration: 24h
+  
+  # Optional custom auth header configuration
+  custom_header_name: "X-Auth-Token"
+  custom_header_type: "token" # "token" or "username"
+
+# CORS settings
+cors:
+  allowed_origins:
+    - "http://localhost:3000"
+    - "https://your-frontend-domain.com"
+  allowed_methods:
+    - "GET"
+    - "POST"
+    - "PUT"
+    - "DELETE"
+    - "OPTIONS"
+  allowed_headers:
+    - "Accept"
+    - "Authorization"
+    - "Content-Type"
+  allow_credentials: true
+  max_age: 300
+
+# Logging configuration
+logging:
+  level: "info" # debug, info, warn, error
+  format: "text" # text or json
+
+# Rate limiting
+rate_limit:
+  enabled: true
+  requests_per_minute: 100
+  
+# Cache settings
+cache:
+  enabled: true
+  max_size: 1GB
+  ttl: 1h 

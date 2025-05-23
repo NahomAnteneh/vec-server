@@ -29,27 +29,23 @@ type PermissionResponse struct {
 }
 
 // AddCollaborator adds a user to a repository with specified permissions
-func AddCollaborator(userService *models.UserService, repoService *models.RepositoryService, permService *models.PermissionService) http.HandlerFunc {
+func AddCollaborator(userService models.UserService, repoService models.RepositoryService, permService models.PermissionService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Get authenticated user
 		authUser := auth.GetUserFromContext(r.Context())
 		if authUser == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
-		// Get repository from URL params
 		username := chi.URLParam(r, "username")
-		repoName := chi.URLParam(r, "repoName")
+		repoName := chi.URLParam(r, "repo")
 
-		// Get repository
 		repo, err := repoService.GetByUsername(username, repoName)
 		if err != nil {
 			http.Error(w, "Repository not found", http.StatusNotFound)
 			return
 		}
 
-		// Check if authenticated user has admin permissions
 		if authUser.ID != repo.OwnerID {
 			hasAdmin, err := permService.HasPermission(authUser.ID, repo.ID, models.AdminPermission)
 			if err != nil || !hasAdmin {
@@ -58,40 +54,34 @@ func AddCollaborator(userService *models.UserService, repoService *models.Reposi
 			}
 		}
 
-		// Parse request body
 		var req PermissionRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request payload", http.StatusBadRequest)
 			return
 		}
 
-		// Validate required fields
 		if req.Username == "" || req.AccessLevel == "" {
 			http.Error(w, "Username and access level are required", http.StatusBadRequest)
 			return
 		}
 
-		// Validate access level
 		if !isValidAccessLevel(req.AccessLevel) {
 			http.Error(w, "Invalid access level. Must be 'read', 'write', or 'admin'", http.StatusBadRequest)
 			return
 		}
 
-		// Get user by username
 		collaborator, err := userService.GetByUsername(req.Username)
 		if err != nil {
 			http.Error(w, "Collaborator user not found", http.StatusNotFound)
 			return
 		}
 
-		// Check if permission already exists
 		existingPerm, err := permService.GetByUserAndRepo(collaborator.ID, repo.ID)
 		if err == nil && existingPerm != nil {
 			http.Error(w, "User is already a collaborator", http.StatusConflict)
 			return
 		}
 
-		// Create permission
 		perm := &models.Permission{
 			UserID:       collaborator.ID,
 			RepositoryID: repo.ID,
@@ -103,7 +93,6 @@ func AddCollaborator(userService *models.UserService, repoService *models.Reposi
 			return
 		}
 
-		// Return success response
 		render.Status(r, http.StatusCreated)
 		render.JSON(w, r, PermissionResponse{
 			ID:          perm.ID,
@@ -118,28 +107,24 @@ func AddCollaborator(userService *models.UserService, repoService *models.Reposi
 }
 
 // RemoveCollaborator removes a user's access to a repository
-func RemoveCollaborator(userService *models.UserService, repoService *models.RepositoryService, permService *models.PermissionService) http.HandlerFunc {
+func RemoveCollaborator(userService models.UserService, repoService models.RepositoryService, permService models.PermissionService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Get authenticated user
 		authUser := auth.GetUserFromContext(r.Context())
 		if authUser == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
-		// Get repository from URL params
 		username := chi.URLParam(r, "username")
-		repoName := chi.URLParam(r, "repoName")
+		repoName := chi.URLParam(r, "repo")
 		collaboratorUsername := chi.URLParam(r, "collaboratorUsername")
 
-		// Get repository
 		repo, err := repoService.GetByUsername(username, repoName)
 		if err != nil {
 			http.Error(w, "Repository not found", http.StatusNotFound)
 			return
 		}
 
-		// Check if authenticated user has admin permissions
 		if authUser.ID != repo.OwnerID {
 			hasAdmin, err := permService.HasPermission(authUser.ID, repo.ID, models.AdminPermission)
 			if err != nil || !hasAdmin {
@@ -148,54 +133,46 @@ func RemoveCollaborator(userService *models.UserService, repoService *models.Rep
 			}
 		}
 
-		// Get collaborator by username
 		collaborator, err := userService.GetByUsername(collaboratorUsername)
 		if err != nil {
 			http.Error(w, "Collaborator user not found", http.StatusNotFound)
 			return
 		}
 
-		// Cannot remove the owner
 		if collaborator.ID == repo.OwnerID {
 			http.Error(w, "Cannot remove repository owner", http.StatusForbidden)
 			return
 		}
 
-		// Delete permission
 		err = permService.DeleteByUserAndRepo(collaborator.ID, repo.ID)
 		if err != nil {
 			http.Error(w, "Failed to remove collaborator: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// Return success with no content
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
 // UpdateCollaboratorPermissions changes a user's access level
-func UpdateCollaboratorPermissions(userService *models.UserService, repoService *models.RepositoryService, permService *models.PermissionService) http.HandlerFunc {
+func UpdateCollaboratorPermissions(userService models.UserService, repoService models.RepositoryService, permService models.PermissionService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Get authenticated user
 		authUser := auth.GetUserFromContext(r.Context())
 		if authUser == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
-		// Get repository from URL params
 		username := chi.URLParam(r, "username")
-		repoName := chi.URLParam(r, "repoName")
+		repoName := chi.URLParam(r, "repo")
 		collaboratorUsername := chi.URLParam(r, "collaboratorUsername")
 
-		// Get repository
 		repo, err := repoService.GetByUsername(username, repoName)
 		if err != nil {
 			http.Error(w, "Repository not found", http.StatusNotFound)
 			return
 		}
 
-		// Check if authenticated user has admin permissions
 		if authUser.ID != repo.OwnerID {
 			hasAdmin, err := permService.HasPermission(authUser.ID, repo.ID, models.AdminPermission)
 			if err != nil || !hasAdmin {
@@ -204,47 +181,40 @@ func UpdateCollaboratorPermissions(userService *models.UserService, repoService 
 			}
 		}
 
-		// Get collaborator by username
 		collaborator, err := userService.GetByUsername(collaboratorUsername)
 		if err != nil {
 			http.Error(w, "Collaborator user not found", http.StatusNotFound)
 			return
 		}
 
-		// Cannot modify the owner's permissions
 		if collaborator.ID == repo.OwnerID {
 			http.Error(w, "Cannot modify repository owner permissions", http.StatusForbidden)
 			return
 		}
 
-		// Parse request body
 		var req PermissionRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request payload", http.StatusBadRequest)
 			return
 		}
 
-		// Validate access level
 		if !isValidAccessLevel(req.AccessLevel) {
 			http.Error(w, "Invalid access level. Must be 'read', 'write', or 'admin'", http.StatusBadRequest)
 			return
 		}
 
-		// Get existing permission
 		perm, err := permService.GetByUserAndRepo(collaborator.ID, repo.ID)
 		if err != nil {
 			http.Error(w, "Collaborator does not have access to this repository", http.StatusNotFound)
 			return
 		}
 
-		// Update permission
 		perm.AccessLevel = req.AccessLevel
 		if err := permService.Update(perm); err != nil {
 			http.Error(w, "Failed to update permissions: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// Return updated permission
 		render.JSON(w, r, PermissionResponse{
 			ID:          perm.ID,
 			Username:    collaborator.Username,
@@ -258,29 +228,24 @@ func UpdateCollaboratorPermissions(userService *models.UserService, repoService 
 }
 
 // ListCollaborators shows all users with access to the repository
-func ListCollaborators(repoService *models.RepositoryService, permService *models.PermissionService) http.HandlerFunc {
+func ListCollaborators(repoService models.RepositoryService, permService models.PermissionService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Get repository from URL params
 		username := chi.URLParam(r, "username")
-		repoName := chi.URLParam(r, "repoName")
+		repoName := chi.URLParam(r, "repo")
 
-		// Get repository
 		repo, err := repoService.GetByUsername(username, repoName)
 		if err != nil {
 			http.Error(w, "Repository not found", http.StatusNotFound)
 			return
 		}
 
-		// Check if repository is private
 		if !repo.IsPublic {
-			// Get authenticated user
 			authUser := auth.GetUserFromContext(r.Context())
 			if authUser == nil {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
 
-			// Check if authenticated user has read access
 			if authUser.ID != repo.OwnerID {
 				hasAccess, err := permService.HasPermission(authUser.ID, repo.ID, models.ReadPermission)
 				if err != nil || !hasAccess {
@@ -290,14 +255,12 @@ func ListCollaborators(repoService *models.RepositoryService, permService *model
 			}
 		}
 
-		// Get all collaborators
 		permissions, err := permService.ListByRepository(repo.ID)
 		if err != nil {
 			http.Error(w, "Failed to list collaborators: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// Format response
 		var collaborators []PermissionResponse
 		for _, perm := range permissions {
 			collaborators = append(collaborators, PermissionResponse{
@@ -311,7 +274,6 @@ func ListCollaborators(repoService *models.RepositoryService, permService *model
 			})
 		}
 
-		// Return collaborators list
 		render.JSON(w, r, map[string]interface{}{
 			"collaborators": collaborators,
 			"owner": map[string]interface{}{
@@ -324,37 +286,31 @@ func ListCollaborators(repoService *models.RepositoryService, permService *model
 }
 
 // GetUserPermission checks a specific user's access level
-func GetUserPermission(userService *models.UserService, repoService *models.RepositoryService, permService *models.PermissionService) http.HandlerFunc {
+func GetUserPermission(userService models.UserService, repoService models.RepositoryService, permService models.PermissionService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Get repository from URL params
 		repoUsername := chi.URLParam(r, "username")
-		repoName := chi.URLParam(r, "repoName")
+		repoName := chi.URLParam(r, "repo")
 		targetUsername := chi.URLParam(r, "targetUsername")
 
-		// Get repository
 		repo, err := repoService.GetByUsername(repoUsername, repoName)
 		if err != nil {
 			http.Error(w, "Repository not found", http.StatusNotFound)
 			return
 		}
 
-		// Get target user
 		targetUser, err := userService.GetByUsername(targetUsername)
 		if err != nil {
 			http.Error(w, "Target user not found", http.StatusNotFound)
 			return
 		}
 
-		// Check if repository is private and the requester has access
 		if !repo.IsPublic {
-			// Get authenticated user
 			authUser := auth.GetUserFromContext(r.Context())
 			if authUser == nil {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
 
-			// Check if authenticated user has read access
 			if authUser.ID != repo.OwnerID {
 				hasAccess, err := permService.HasPermission(authUser.ID, repo.ID, models.ReadPermission)
 				if err != nil || !hasAccess {
@@ -364,45 +320,40 @@ func GetUserPermission(userService *models.UserService, repoService *models.Repo
 			}
 		}
 
-		// If target user is the repository owner
 		if targetUser.ID == repo.OwnerID {
 			render.JSON(w, r, map[string]interface{}{
 				"username":     targetUser.Username,
 				"user_id":      targetUser.ID,
 				"repo_name":    repo.Name,
 				"repo_id":      repo.ID,
-				"access_level": "owner", // Owner has implicit admin rights
+				"access_level": "owner",
 			})
 			return
 		}
 
-		// Check if user has explicit permissions
 		permission, err := permService.GetByUserAndRepo(targetUser.ID, repo.ID)
 		if err != nil {
-			// For public repositories, all users have at least read access
 			if repo.IsPublic {
 				render.JSON(w, r, map[string]interface{}{
 					"username":     targetUser.Username,
 					"user_id":      targetUser.ID,
 					"repo_name":    repo.Name,
 					"repo_id":      repo.ID,
-					"access_level": models.ReadPermission, // Public repos provide read access
+					"access_level": models.ReadPermission,
 				})
 				return
 			}
 
-			// No access for private repos
 			render.JSON(w, r, map[string]interface{}{
 				"username":     targetUser.Username,
 				"user_id":      targetUser.ID,
 				"repo_name":    repo.Name,
 				"repo_id":      repo.ID,
-				"access_level": "none", // No access
+				"access_level": "none",
 			})
 			return
 		}
 
-		// Return user's explicit permission
 		render.JSON(w, r, map[string]interface{}{
 			"username":     targetUser.Username,
 			"user_id":      targetUser.ID,
@@ -412,8 +363,6 @@ func GetUserPermission(userService *models.UserService, repoService *models.Repo
 		})
 	}
 }
-
-// Helper functions
 
 // isValidAccessLevel checks if an access level is valid
 func isValidAccessLevel(level string) bool {

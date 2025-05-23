@@ -91,28 +91,6 @@ func Logging() func(http.Handler) http.Handler {
 	}
 }
 
-// RequestIDMiddleware extracts or generates a request ID and adds it to the context
-func RequestIDMiddleware() func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Extract request ID from header if present
-			requestID := r.Header.Get("X-Request-ID")
-			if requestID == "" {
-				// Generate a new request ID
-				requestID = uuid.New().String()
-				r.Header.Set("X-Request-ID", requestID)
-			}
-
-			// Add request ID to response headers
-			w.Header().Set("X-Request-ID", requestID)
-
-			// Store in context
-			ctx := context.WithValue(r.Context(), RequestIDKey, requestID)
-			next.ServeHTTP(w, r.WithContext(ctx))
-		})
-	}
-}
-
 // ErrorLogMiddleware logs errors and recovers from panics
 func ErrorLogMiddleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
