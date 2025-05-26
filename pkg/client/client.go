@@ -20,7 +20,7 @@ const (
 
 	// Standard content types
 	ContentTypeJSON = "application/json"
-	ContentTypeGit  = "application/x-vec"
+	ContentTypeVec  = "application/x-vec"
 
 	// Service names for Vec Smart HTTP Protocol
 	ServiceUploadPack  = "vec-upload-pack"
@@ -346,7 +346,7 @@ func (c *Client) PostBinary(ctx context.Context, urlPath string, data []byte, co
 	}
 
 	if contentType == "" {
-		contentType = ContentTypeGit
+		contentType = ContentTypeVec
 	}
 
 	req.Header.Set("Content-Type", contentType)
@@ -376,7 +376,7 @@ func (c *Client) GetInfoRefs(ctx context.Context, username, repoName, service st
 	req.URL.RawQuery = q.Encode()
 
 	// Accept git content type
-	req.Header.Set("Accept", ContentTypeGit)
+	req.Header.Set("Accept", ContentTypeVec)
 
 	resp, err := c.Do(req)
 	if err != nil {
@@ -396,8 +396,8 @@ func (c *Client) PostUploadPack(ctx context.Context, username, repoName string, 
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", ContentTypeGit)
-	req.Header.Set("Accept", ContentTypeGit)
+	req.Header.Set("Content-Type", ContentTypeVec)
+	req.Header.Set("Accept", ContentTypeVec)
 
 	resp, err := c.Do(req)
 	if err != nil {
@@ -417,8 +417,8 @@ func (c *Client) PostReceivePack(ctx context.Context, username, repoName string,
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", ContentTypeGit)
-	req.Header.Set("Accept", ContentTypeGit)
+	req.Header.Set("Content-Type", ContentTypeVec)
+	req.Header.Set("Accept", ContentTypeVec)
 
 	resp, err := c.Do(req)
 	if err != nil {

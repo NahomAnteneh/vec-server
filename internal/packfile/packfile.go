@@ -3,7 +3,7 @@ package packfile
 import (
 	"bytes"
 	"compress/zlib"
-	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -15,8 +15,8 @@ import (
 
 // FinalizePackfile prepares a packfile for transmission by adding checksums and other metadata
 func FinalizePackfile(packfile []byte) []byte {
-	// Calculate the SHA-1 checksum of the packfile content
-	h := sha1.New()
+	// Calculate the SHA-256 checksum of the packfile content
+	h := sha256.New()
 	h.Write(packfile)
 	checksum := h.Sum(nil)
 
@@ -30,8 +30,8 @@ func FinalizePackfile(packfile []byte) []byte {
 
 // CalculatePackfileChecksum calculates a checksum for the packfile
 func CalculatePackfileChecksum(packfile []byte) []byte {
-	// Calculate SHA-1 checksum of the packfile
-	h := sha1.New()
+	// Calculate SHA-256 checksum of the packfile
+	h := sha256.New()
 	h.Write(packfile)
 	return h.Sum(nil)
 }
@@ -58,7 +58,7 @@ func PrintPackfileStats(objects []Object) {
 
 	// Print counts by type
 	for t, count := range typeCounts {
-		fmt.Printf("  %s: %d objects\n", typeToString(t), count)
+		fmt.Printf("  %s: %d objects\n", TypeToString(t), count)
 	}
 
 	// Calculate and print total data size
@@ -71,42 +71,43 @@ func PrintPackfileStats(objects []Object) {
 
 // CreatePackfile creates a packfile from a list of object hashes in a repository
 // and returns the binary packfile data for remote operations
-func CreatePackfile(repoRoot string, objectHashes []string) ([]byte, error) {
-	// Create a temporary file to store the packfile
-	tempDir := os.TempDir()
-	tempFile, err := os.CreateTemp(tempDir, "vec-packfile-*.pack")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temporary packfile: %w", err)
+func CreatePackfile(repo *core.Repository, objectHashes []string) ([]byte, error) {
+	var objects []Object
+
+	// Load each object and add to the list
+	for _, hash := range objectHashes {
+		objType, objData, err := core.ReadObject(repo.Root, hash)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read object %s: %w", hash, err)
+		}
+
+		// Convert type string to ObjectType
+		var objTypeEnum ObjectType
+		switch objType {
+		case "commit":
+			objTypeEnum = OBJ_COMMIT
+		case "tree":
+			objTypeEnum = OBJ_TREE
+		case "blob":
+			objTypeEnum = OBJ_BLOB
+		case "tag":
+			objTypeEnum = OBJ_TAG
+		default:
+			return nil, fmt.Errorf("unknown object type %s for %s", objType, hash)
+		}
+
+		objects = append(objects, Object{
+			Hash: hash,
+			Type: objTypeEnum,
+			Data: objData,
+		})
 	}
-	tempFilePath := tempFile.Name()
-	tempFile.Close() // Close immediately as we'll reopen it later
 
-	// Clean up the temporary file when done
-	defer os.Remove(tempFilePath)
-
-	// Create the packfile using the repository objects
-	if err := CreatePackfileFromHashes(repoRoot, objectHashes, tempFilePath, true); err != nil {
-		return nil, fmt.Errorf("failed to create packfile: %w", err)
-	}
-
-	// Read the packfile contents
-	packfileData, err := os.ReadFile(tempFilePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read packfile: %w", err)
-	}
-
-	return packfileData, nil
+	// Create the packfile from the objects
+	return CreatePackfileFromObjects(objects)
 }
 
-// CreatePackfileFromHashes creates a packfile from a list of object hashes in a repository (legacy function).
-// This function is used by the maintenance code.
-func CreatePackfileFromHashes(repoPath string, objectHashes []string, outputPath string, withDeltaCompression bool) error {
-	repo := core.NewRepository(repoPath)
-	return CreatePackfileFromHashesRepo(repo, objectHashes, outputPath, withDeltaCompression)
-}
-
-// CreatePackfileFromHashesRepo creates a packfile from a list of object hashes in a repository using Repository context.
-// This function is used by the maintenance code.
+// CreatePackfileFromHashesRepo creates a packfile on disk from a list of object hashes
 func CreatePackfileFromHashesRepo(repo *core.Repository, objectHashes []string, outputPath string, withDeltaCompression bool) error {
 	// Load objects from the repository
 	objects := make([]Object, 0, len(objectHashes))
@@ -171,22 +172,30 @@ func CreatePackfileFromHashesRepo(repo *core.Repository, objectHashes []string, 
 		}
 
 		// Add the object to our collection
+		var hashBytes [hashLength]byte
+		decoded, err := hex.DecodeString(hash)
+		if err == nil {
+			copy(hashBytes[:], decoded)
+		}
+
 		objects = append(objects, Object{
-			Hash: hash,
-			Type: objType,
-			Data: content[nullIndex+1:],
+			Hash:      hash,
+			HashBytes: hashBytes,
+			Type:      objType,
+			Data:      content[nullIndex+1:],
+			Size:      uint64(len(content[nullIndex+1:])),
 		})
 	}
 
 	// Apply delta compression if requested
-	if withDeltaCompression && len(objects) > 1 {
-		var err error
-		objects, err = OptimizeObjects(objects)
+	if withDeltaCompression {
+		optimizedObjects, err := OptimizeObjects(objects)
 		if err != nil {
 			return fmt.Errorf("failed to optimize objects: %w", err)
 		}
+		return CreateModernPackfile(optimizedObjects, outputPath)
 	}
 
-	// Create the packfile
+	// Create a simple packfile without delta compression
 	return CreateModernPackfile(objects, outputPath)
 }

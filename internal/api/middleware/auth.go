@@ -58,7 +58,7 @@ func AuthenticationMiddleware(cfg *config.Config, db *gorm.DB) func(http.Handler
 
 			// No valid authentication provided
 			w.Header().Set("WWW-Authenticate", `Basic realm="Vec Server", Bearer`)
-			http.Error(w, "Unauthorized: Authentication required with username/email and password hash", http.StatusUnauthorized)
+			http.Error(w, "Unauthorized: Authentication required with username/email and password", http.StatusUnauthorized)
 			return
 		})
 	}
@@ -92,31 +92,28 @@ func tryAuthMethods(r *http.Request, cfg *config.Config, db *gorm.DB) *models.Us
 }
 
 // authenticateBasic attempts to authenticate using Basic auth
-// This implementation directly checks the provided password hash against the username
 func authenticateBasic(r *http.Request, db *gorm.DB) *models.User {
-	username, passwordHash, ok := r.BasicAuth()
-	log.Printf("authenticateBasic: Username='%s', PasswordHashProvided=%t, BasicAuthOK=%t", username, passwordHash != "", ok)
-	if !ok || username == "" || passwordHash == "" {
+	username, password, ok := r.BasicAuth()
+	log.Printf("authenticateBasic: Username='%s', PasswordProvided=%t, BasicAuthOK=%t", username, password != "", ok)
+	if !ok || username == "" || password == "" {
 		log.Println("authenticateBasic: Invalid basic auth credentials")
 		return nil
 	}
 
-	// Get user from database
-	userService := models.NewUserService(db)
-	user, err := userService.GetByUsername(username)
+	// Use the auth package to authenticate the user with username and password
+	user, err := auth.AuthenticateUser(db, username, password)
 	if err != nil {
-		// Try to find by email if username not found
-		user, err = userService.GetByEmail(username)
-		if err != nil {
-			log.Printf("authenticateBasic: No user found with username/email '%s'", username)
-			return nil
+		// Try to authenticate by email if username didn't work
+		userService := models.NewUserService(db)
+		emailUser, err := userService.GetByEmail(username)
+		if err == nil {
+			// We found a user with this email, now check the password
+			if auth.CheckPasswordHash(password, emailUser.PasswordHash) {
+				log.Printf("authenticateBasic: Authentication successful for user ID %d (%s) using email", emailUser.ID, username)
+				return emailUser
+			}
 		}
-	}
-	log.Printf("authenticateBasic: Found user ID %d for username/email '%s'", user.ID, username)
-
-	// Direct password hash comparison
-	if user.PasswordHash != passwordHash {
-		log.Printf("authenticateBasic: Password hash mismatch for user ID %d", user.ID)
+		log.Printf("authenticateBasic: Authentication failed for '%s': %v", username, err)
 		return nil
 	}
 

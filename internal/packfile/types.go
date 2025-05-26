@@ -1,10 +1,14 @@
 package packfile
 
-import "fmt"
+import (
+	"encoding/hex"
+	"fmt"
+)
 
 // Constants
 const (
-	hashLength = 64 // SHA-256 hash length in hex form (32 bytes represented as 64 hex characters)
+	hashLength    = 32 // SHA-256 hash length in bytes
+	hexHashLength = 64 // SHA-256 hash length in hex form (32 bytes represented as 64 hex characters)
 
 	// Object type bits in packed format
 	TYPE_OFS_DELTA = 6 // Delta with offset to base
@@ -32,28 +36,38 @@ const (
 
 // Object represents a parsed object from a packfile.
 type Object struct {
-	Hash string     // SHA-1 hash in hex format
-	Type ObjectType // Object type
-	Data []byte     // Object data
-
-	// For delta objects
-	BaseHash string // Hash of base object (if this is a delta)
-	// IsDelta bool // Field removed, infer from Type (OBJ_REF_DELTA, OBJ_OFS_DELTA)
+	Hash          string           // SHA-256 hash in hex format
+	HashBytes     [hashLength]byte // SHA-256 hash in bytes
+	Type          ObjectType       // Object type
+	Data          []byte           // Object data
+	BaseHash      string           // Hash of base object (if this is a delta)
+	BaseHashBytes [hashLength]byte // Base hash in bytes (if delta)
+	Offset        int64            // Offset in packfile
+	Size          uint64           // Size of object data
+	BaseIndex     int              // Index of base object in objects array (if OFS_DELTA)
 }
 
 // DeltaObject represents a delta object with a base object hash and delta instructions
 type DeltaObject struct {
-	BaseHash string     // Hash of the base object
-	Hash     string     // Hash of the resulting object after applying delta
-	Type     ObjectType // Type of the final object (inherited from base)
-	Delta    []byte     // Delta instructions
+	BaseHash      string           // Hash of the base object
+	BaseHashBytes [hashLength]byte // Base hash in bytes
+	Hash          string           // Hash of the resulting object after applying delta
+	HashBytes     [hashLength]byte // Resulting hash in bytes
+	Type          ObjectType       // Type of the final object (inherited from base)
+	Delta         []byte           // Delta instructions
+	TargetSize    uint64           // Size of reconstructed object
 }
 
 // PackfileIndex represents an index for a packfile
 type PackfileIndex struct {
-	Version  uint32                    // Index format version
-	Entries  map[string]PackIndexEntry // Map from hash to entry
-	Checksum []byte                    // SHA-1 checksum of the packfile
+	Version      uint32                    // Index format version
+	Entries      map[string]PackIndexEntry // Map from hash to entry
+	Checksum     []byte                    // SHA-256 checksum of the packfile
+	Fanout       [256]uint32               // Fanout table
+	Offsets      []uint32                  // Object offsets
+	Hashes       [][hashLength]byte        // Object hashes
+	CRCs         []uint32                  // CRC32 checksums
+	PackChecksum [hashLength]byte          // Packfile checksum
 }
 
 // PackIndexEntry stores information about an object in the packfile
@@ -71,8 +85,8 @@ type PackFileHeader struct {
 	NumObjects uint32  // Number of objects in the pack
 }
 
-// typeToString converts an ObjectType to its string representation
-func typeToString(objType ObjectType) string {
+// TypeToString converts an ObjectType to its string representation
+func TypeToString(objType ObjectType) string {
 	switch objType {
 	case OBJ_COMMIT:
 		return "commit"
@@ -91,8 +105,8 @@ func typeToString(objType ObjectType) string {
 	}
 }
 
-// stringToType converts a string type name to ObjectType
-func stringToType(typeName string) ObjectType {
+// StringToType converts a string type name to ObjectType
+func StringToType(typeName string) ObjectType {
 	switch typeName {
 	case "commit":
 		return OBJ_COMMIT
@@ -107,4 +121,30 @@ func stringToType(typeName string) ObjectType {
 	default:
 		return OBJ_NONE
 	}
+}
+
+// For backward compatibility
+func typeToString(objType ObjectType) string {
+	return TypeToString(objType)
+}
+
+// For backward compatibility
+func stringToType(typeName string) ObjectType {
+	return StringToType(typeName)
+}
+
+// Helper function to convert hex string to byte array
+func hexToBytes(hexStr string) ([hashLength]byte, error) {
+	var result [hashLength]byte
+	if len(hexStr) != hexHashLength {
+		return result, fmt.Errorf("invalid hash length: expected %d, got %d", hexHashLength, len(hexStr))
+	}
+
+	bytes, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return result, err
+	}
+
+	copy(result[:], bytes)
+	return result, nil
 }

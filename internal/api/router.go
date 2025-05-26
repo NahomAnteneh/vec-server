@@ -73,14 +73,23 @@ func SetupRouter(cfg *config.Config, repoManager *repository.Manager, db *gorm.D
 		if !ok || repoCtx.Repository == nil {
 			return fmt.Errorf("repository context not found")
 		}
-		user := auth.GetUserFromContext(ctx)
-		if user == nil {
-			return fmt.Errorf("user not authenticated")
-		}
+
+		// For public repositories and read operations (vec-upload-pack), allow access without authentication
 		permLevel := models.ReadPermission
 		if r.Method == http.MethodPost && r.URL.Path == "/"+repoCtx.Repository.Owner.Username+"/"+repoCtx.Repository.Name+"/vec-receive-pack" {
 			permLevel = models.WritePermission
 		}
+
+		// Allow public repositories to be cloned without authentication
+		if permLevel == models.ReadPermission && repoCtx.Repository.IsPublic {
+			return nil
+		}
+
+		user := auth.GetUserFromContext(ctx)
+		if user == nil {
+			return fmt.Errorf("user not authenticated")
+		}
+
 		permService := ctx.Value("permissionService").(models.PermissionService)
 		hasPermission, err := permService.HasPermission(user.ID, repoCtx.Repository.ID, permLevel)
 		if err != nil || !hasPermission {
@@ -94,52 +103,42 @@ func SetupRouter(cfg *config.Config, repoManager *repository.Manager, db *gorm.D
 		render.JSON(w, r, map[string]string{"status": "ok"})
 	})
 
-	// API v1 routes
-	r.Route("/api/v1", func(r chi.Router) {
-		// User repositories
-		r.Get("/users/{username}/repos", handlers.ListUserRepositories(repoService))
+	// User repositories
+	r.Get("/users/{username}/repos", handlers.ListUserRepositories(repoService))
 
-		// Repository management
-		r.With(middleware.AuthenticationMiddleware(cfg, db)).
-			Post("/repos", handlers.CreateRepository(repoService))
+	// Repository management
+	r.With(middleware.AuthenticationMiddleware(cfg, db)).
+		Post("/create", handlers.CreateRepository(repoService))
 
-		// Repository CRUD operations
-		r.Route("/repos/{username}/{repo}", func(r chi.Router) {
-			r.Use(createRepositoryMiddleware(db, repoManager))
-
-			// General repository info
-			r.Get("/", handlers.GetRepository(repoService))
-
-			// Update/Delete operations (require authentication)
-			r.With(middleware.AuthenticationMiddleware(cfg, db)).
-				Put("/", handlers.UpdateRepository(repoService))
-			r.With(middleware.AuthenticationMiddleware(cfg, db)).
-				Delete("/", handlers.DeleteRepository(repoService))
-			r.With(middleware.AuthenticationMiddleware(cfg, db)).
-				Post("/fork", handlers.ForkRepository(repoService))
-
-			// Repository content information
-			r.Get("/branches", handlers.ListBranches(repoManager))
-			r.Get("/branches/{branch}", handlers.GetBranch(repoManager))
-			r.Get("/commits", handlers.ListCommits(repoManager))
-			r.Get("/commits/{commit}", handlers.GetCommit(repoManager))
-			r.Get("/tree/{ref}", handlers.GetTreeContents(repoManager))
-			r.Get("/tree/{ref}/{path:.+}", handlers.GetTreeContents(repoManager))
-			r.Get("/blob/{ref}/{path:.+}", handlers.GetBlob(repoManager))
-		})
-	})
-
-	// Vec Protocol endpoints - focused only on repository operations
+	// Repository CRUD operations and Vec Protocol endpoints
 	r.Route("/{username}/{repo}", func(r chi.Router) {
 		r.Use(createRepositoryMiddleware(db, repoManager))
 
-		// Repository discovery - public for info/refs
+		// General repository info
+		r.Get("/", handlers.GetRepository(repoService))
+
+		// Update/Delete operations (require authentication)
+		r.With(middleware.AuthenticationMiddleware(cfg, db)).
+			Put("/", handlers.UpdateRepository(repoService))
+		r.With(middleware.AuthenticationMiddleware(cfg, db)).
+			Delete("/", handlers.DeleteRepository(repoService))
+		r.With(middleware.AuthenticationMiddleware(cfg, db)).
+			Post("/fork", handlers.ForkRepository(repoService))
+
+		// Repository content information
+		r.Get("/branches", handlers.ListBranches(repoManager))
+		r.Get("/branches/{branch}", handlers.GetBranch(repoManager))
+		r.Get("/commits", handlers.ListCommits(repoManager))
+		r.Get("/commits/{commit}", handlers.GetCommit(repoManager))
+		r.Get("/tree/{ref}", handlers.GetTreeContents(repoManager))
+		r.Get("/tree/{ref}/{path:.+}", handlers.GetTreeContents(repoManager))
+		r.Get("/blob/{ref}/{path:.+}", handlers.GetBlob(repoManager))
+
+		// Vec Protocol endpoints
 		r.Get("/info/refs", protocol.InfoRefsHandler(repoManager, logger))
 
-		// Upload-pack (fetch/clone) - requires read permission
-		r.With(middleware.AuthenticationMiddleware(cfg, db)).
-			With(middleware.RequirePermission(models.ReadPermission)).
-			Post("/vec-upload-pack", protocol.UploadPackHandler(repoManager, logger, authorize))
+		// Upload-pack (fetch/clone) - allows public access for public repositories
+		r.Post("/vec-upload-pack", protocol.UploadPackHandler(repoManager, logger, authorize))
 
 		// Receive-pack (push) - requires write permission
 		r.With(middleware.AuthenticationMiddleware(cfg, db)).

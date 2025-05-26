@@ -24,13 +24,31 @@ func ParsePackfile(packfile []byte) ([]Object, error) {
 	offset := 4
 
 	for i := 0; i < int(numObjects); i++ {
-		if offset+hashLength+4 > len(packfile) {
+		// Determine if we're dealing with SHA-1 or SHA-256 based on the packfile format
+		hashLen := 40 // Default to SHA-1 hex format (40 chars)
+		if offset+hashLen+4 > len(packfile) {
 			return nil, errors.New("packfile format error: incomplete object header")
 		}
 
-		hashBytes := packfile[offset : offset+hashLength]
+		hashBytes := packfile[offset : offset+hashLen]
 		hash := string(hashBytes) // Assumes hash is stored as a hex string.
-		offset += hashLength
+		offset += hashLen
+
+		// Try to populate HashBytes for compatibility
+		var hashBinaryBytes [hashLength]byte
+		if len(hash) == 40 { // SHA-1
+			// For SHA-1, we'll pad it to match our internal format
+			sha1Bytes, err := hex.DecodeString(hash)
+			if err == nil && len(sha1Bytes) == 20 {
+				// Pad with zeros to match SHA-256 length
+				copy(hashBinaryBytes[:], sha1Bytes)
+			}
+		} else if len(hash) == 64 { // SHA-256
+			binaryBytes, err := hex.DecodeString(hash)
+			if err == nil && len(binaryBytes) == 32 {
+				copy(hashBinaryBytes[:], binaryBytes)
+			}
+		}
 
 		dataLen := int(binary.BigEndian.Uint32(packfile[offset : offset+4]))
 		offset += 4
@@ -55,9 +73,11 @@ func ParsePackfile(packfile []byte) ([]Object, error) {
 		offset += dataLen - 1
 
 		objects = append(objects, Object{
-			Hash: hash,
-			Type: objType,
-			Data: data,
+			Hash:      hash,
+			HashBytes: hashBinaryBytes,
+			Type:      objType,
+			Data:      data,
+			Size:      uint64(len(data)),
 		})
 	}
 
@@ -87,12 +107,13 @@ func ParseModernPackfile(packfilePath string, useIndex bool) ([]Object, error) {
 		return nil, fmt.Errorf("unsupported packfile version: %d", header.Version)
 	}
 
-	// Store object locations and information
+	// Store information about each object
 	type objectInfo struct {
-		offset   int64  // File offset of object
-		isDelta  bool   // Whether this is a delta object
-		baseHash string // Base object hash (for REF_DELTA)
-		basePos  int64  // Base object position (for OFS_DELTA)
+		offset        int64            // File offset of object
+		isDelta       bool             // Whether this is a delta object
+		baseHash      string           // Base object hash (for REF_DELTA)
+		basePos       int64            // Base object position (for OFS_DELTA)
+		baseHashBytes [hashLength]byte // Base hash in binary format
 	}
 
 	// Store information about each object
@@ -140,12 +161,61 @@ func ParseModernPackfile(packfilePath string, useIndex bool) ([]Object, error) {
 		if objType == OBJ_REF_DELTA {
 			info.isDelta = true
 
-			// Read base hash for reference delta
-			baseHashBytes := make([]byte, 20)
-			if _, err := io.ReadFull(file, baseHashBytes); err != nil {
-				return nil, fmt.Errorf("failed to read base hash for object %d: %w", i, err)
+			// Check if we're using SHA-1 (20 bytes) or SHA-256 (32 bytes)
+			// We'll try to detect by reading first and checking the zlib header
+			pos, err := file.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get current position: %w", err)
 			}
-			info.baseHash = fmt.Sprintf("%x", baseHashBytes)
+
+			// Try SHA-1 first (most common)
+			baseHashBytes20 := make([]byte, 20) // SHA-1 is 20 bytes
+			_, err = io.ReadFull(file, baseHashBytes20)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read base hash for REF_DELTA: %w", err)
+			}
+
+			// Check if what follows is a valid zlib header
+			zlibHeader := make([]byte, 2)
+			_, err = io.ReadFull(file, zlibHeader)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read zlib header: %w", err)
+			}
+
+			// Seek back to prepare for actual read
+			_, err = file.Seek(pos, io.SeekStart)
+			if err != nil {
+				return nil, fmt.Errorf("failed to reset position: %w", err)
+			}
+
+			// Determine hash format based on zlib header
+			// Valid zlib header starts with 0x78
+			if zlibHeader[0] == 0x78 {
+				// It's SHA-1 format
+				_, err = io.ReadFull(file, baseHashBytes20)
+				if err != nil {
+					return nil, fmt.Errorf("failed to re-read SHA-1 base hash: %w", err)
+				}
+				info.baseHash = fmt.Sprintf("%x", baseHashBytes20)
+
+				// Create a byte array for the base hash
+				var baseHashBinary [hashLength]byte
+				copy(baseHashBinary[:], baseHashBytes20)
+				info.baseHashBytes = baseHashBinary
+			} else {
+				// It's likely SHA-256 format (32 bytes)
+				baseHashBytes32 := make([]byte, 32)
+				_, err = io.ReadFull(file, baseHashBytes32)
+				if err != nil {
+					return nil, fmt.Errorf("failed to read SHA-256 base hash: %w", err)
+				}
+				info.baseHash = fmt.Sprintf("%x", baseHashBytes32)
+
+				// Store the hash bytes
+				var baseHashBinary [hashLength]byte
+				copy(baseHashBinary[:], baseHashBytes32)
+				info.baseHashBytes = baseHashBinary
+			}
 		} else if objType == OBJ_OFS_DELTA {
 			info.isDelta = true
 
@@ -199,29 +269,31 @@ func ParseModernPackfile(packfilePath string, useIndex bool) ([]Object, error) {
 		info     objectInfo
 	}
 
-	// Process non-delta objects first
 	for objIndex, info := range objectInfos {
 		if !info.isDelta {
-			// Seek to the object
-			_, err = file.Seek(info.offset, 0)
+			// Not a delta, read normally
+			_, err = file.Seek(info.offset, io.SeekStart)
 			if err != nil {
 				return nil, fmt.Errorf("failed to seek to object at offset %d: %w", info.offset, err)
 			}
 
-			// Read the object
 			obj, err := readPackObject(file)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read object at offset %d: %w", info.offset, err)
 			}
 
-			// Calculate hash for non-delta objects
-			obj.Hash = calculateObjectHash(obj.Type, obj.Data)
+			// Calculate object hash
+			hash := calculateObjectHash(obj.Type, obj.Data)
+			hashBytes, _ := hexToBytes(hash)
 
-			// Store the object
+			obj.Hash = hash
+			obj.HashBytes = hashBytes
+			obj.Offset = info.offset
+
 			objects = append(objects, *obj)
-			objectsByOffset[info.offset] = obj
+			objectsByOffset[info.offset] = &objects[len(objects)-1]
 		} else {
-			// Collect delta objects for third pass
+			// This is a delta object, we'll resolve it in the third pass
 			deltaObjects = append(deltaObjects, struct {
 				objIndex uint64
 				info     objectInfo
@@ -229,107 +301,81 @@ func ParseModernPackfile(packfilePath string, useIndex bool) ([]Object, error) {
 		}
 	}
 
-	// Sort delta objects to ensure base objects are processed before dependent deltas
+	// Sort delta objects by dependency order
 	sort.Slice(deltaObjects, func(i, j int) bool {
-		infoI, infoJ := deltaObjects[i].info, deltaObjects[j].info
+		infoI := deltaObjects[i].info
+		infoJ := deltaObjects[j].info
 
-		// Process REF_DELTA before OFS_DELTA
+		// Handle ref deltas vs offset deltas
 		if infoI.baseHash != "" && infoJ.baseHash == "" {
-			return true
+			return true // Ref deltas before offset deltas
 		}
 		if infoI.baseHash == "" && infoJ.baseHash != "" {
 			return false
 		}
 
-		// For OFS_DELTA, process in order of base offset (lowest first)
+		// For offset deltas, order by base position
 		if infoI.baseHash == "" {
 			return infoI.basePos < infoJ.basePos
 		}
 
-		// Default to lower index first
+		// For ref deltas with the same base, use original index
 		return deltaObjects[i].objIndex < deltaObjects[j].objIndex
 	})
 
-	// Third pass: resolve and apply deltas
-	for _, d := range deltaObjects {
-		info := d.info // This info is from the first pass and reliably tells us delta type and base ref
+	// Third pass: resolve delta objects
+	for _, delta := range deltaObjects {
+		info := delta.info
 
-		// Seek to the object
-		_, err = file.Seek(info.offset, 0)
+		_, err = file.Seek(info.offset, io.SeekStart)
 		if err != nil {
-			return nil, fmt.Errorf("failed to seek to delta at offset %d: %w", info.offset, err)
+			return nil, fmt.Errorf("failed to seek to delta object at offset %d: %w", info.offset, err)
 		}
 
-		// Read the delta object (which includes its specific delta type and delta data)
-		deltaRawObj, err := readPackObject(file)
+		deltaObj, err := readPackObject(file)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read delta object at offset %d: %w", info.offset, err)
 		}
 
-		// Verify that what we read is indeed a delta, consistent with the first pass info
-		if !(deltaRawObj.Type == OBJ_REF_DELTA || deltaRawObj.Type == OBJ_OFS_DELTA) {
-			return nil, fmt.Errorf("object at offset %d was expected to be a delta, but read as type %s",
-				info.offset, typeToString(deltaRawObj.Type))
-		}
-
-		// Find the base object
+		// Find base object
 		var baseObj *Object
-
-		if info.isDelta && info.baseHash != "" { // This was identified as REF_DELTA in the first pass
-			if deltaRawObj.Type != OBJ_REF_DELTA {
-				return nil, fmt.Errorf("mismatch: first pass said REF_DELTA, readPackObject returned %s for delta at %d", typeToString(deltaRawObj.Type), info.offset)
-			}
-			// Find the base by hash
-			foundBase := false
+		if info.baseHash != "" {
+			// Reference delta - find base by hash
 			for i := range objects {
-				if objects[i].Hash == info.baseHash { // info.baseHash is from the first pass scan
+				if objects[i].Hash == info.baseHash {
 					baseObj = &objects[i]
-					foundBase = true
 					break
 				}
 			}
-			if !foundBase {
-				return nil, fmt.Errorf("base object with hash %s not found for REF_DELTA at offset %d", info.baseHash, info.offset)
-			}
-		} else if info.isDelta { // This was identified as OFS_DELTA in the first pass (baseHash would be empty in info)
-			if deltaRawObj.Type != OBJ_OFS_DELTA {
-				return nil, fmt.Errorf("mismatch: first pass said OFS_DELTA, readPackObject returned %s for delta at %d", typeToString(deltaRawObj.Type), info.offset)
-			}
-			// Find the base by offset
-			baseObj = objectsByOffset[info.basePos] // info.basePos is from the first pass scan
 		} else {
-			// Should not happen as we are iterating d.info which are all deltas
-			return nil, fmt.Errorf("internal error: processing non-delta in delta loop at offset %d", info.offset)
+			// Offset delta - find base by offset
+			baseObj = objectsByOffset[info.basePos]
 		}
 
 		if baseObj == nil {
-			var baseRefStr string
-			if info.baseHash != "" {
-				baseRefStr = "hash " + info.baseHash
-			} else {
-				baseRefStr = fmt.Sprintf("offset %d", info.basePos)
-			}
-			return nil, fmt.Errorf("base object not found for delta at offset %d (type %s, baseRef: %s)",
-				info.offset, typeToString(deltaRawObj.Type), baseRefStr)
+			return nil, fmt.Errorf("base object not found for delta at offset %d", info.offset)
 		}
 
-		// Apply the delta
-		resultData, err := applyDelta(baseObj.Data, deltaRawObj.Data)
+		// Apply delta to base object
+		resultData, err := applyDelta(baseObj.Data, deltaObj.Data)
 		if err != nil {
-			return nil, fmt.Errorf("failed to apply delta at offset %d (base type %s, delta type %s): %w",
-				info.offset, typeToString(baseObj.Type), typeToString(deltaRawObj.Type), err)
+			return nil, fmt.Errorf("failed to apply delta at offset %d: %w", info.offset, err)
 		}
 
-		// Create the resulting object
+		// Create resolved object (inherits type from base)
 		resultObj := Object{
-			Type: baseObj.Type, // Inherit type from base
-			Data: resultData,
+			Type:     baseObj.Type,
+			Data:     resultData,
+			Offset:   info.offset,
+			Size:     uint64(len(resultData)),
+			BaseHash: info.baseHash,
 		}
 
-		// Calculate the hash
+		// Calculate hash for the resolved object
 		resultObj.Hash = calculateObjectHash(resultObj.Type, resultObj.Data)
+		resultObj.HashBytes, _ = hexToBytes(resultObj.Hash)
 
-		// Store the resolved object
+		// Add to objects list
 		objects = append(objects, resultObj)
 		objectsByOffset[info.offset] = &objects[len(objects)-1]
 	}
@@ -338,54 +384,91 @@ func ParseModernPackfile(packfilePath string, useIndex bool) ([]Object, error) {
 }
 
 // readPackObject reads a single object from a packfile
-// It returns the raw object, which could be a delta object (Type=OBJ_REF_DELTA or OBJ_OFS_DELTA)
-// or a non-delta object.
 func readPackObject(file *os.File) (*Object, error) {
-	// Start position for this object
 	startPos, err := file.Seek(0, io.SeekCurrent)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get file position: %w", err)
+		return nil, fmt.Errorf("failed to get current position: %w", err)
 	}
 
-	// Read the first byte of the header
+	// Read the first byte which contains the type and part of the size
 	headerByte, err := readByte(file)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read object header: %w", err)
+		return nil, fmt.Errorf("failed to read object header byte: %w", err)
 	}
 
-	// Extract object type (bits 4-6) and the first 4 bits of size from the header
+	// Extract the type from bits 4-6
 	objectType := ObjectType((headerByte >> 4) & 0x7)
+
+	// Extract the size (starts in the lower 4 bits)
 	size := uint64(headerByte & 0x0F)
 	shift := uint(4)
 
-	// Parse variable-length size encoding
+	// Read the variable-length size
 	for headerByte&0x80 != 0 {
 		headerByte, err = readByte(file)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read size continuation: %w", err)
+			return nil, fmt.Errorf("failed to read size byte: %w", err)
 		}
 		size |= uint64(headerByte&0x7F) << shift
 		shift += 7
 	}
 
-	// currentIsDelta removed as Object.IsDelta field is gone.
-	// Delta status is inferred from objectType.
-	var currentBaseHash string // Only populated for OBJ_REF_DELTA
+	// For delta objects, we need to read the base reference
+	var currentBaseHash string
+	var baseHashBytes [hashLength]byte
 
 	if objectType == OBJ_REF_DELTA {
-		// currentIsDelta = true // No longer needed
-		baseHashBytes := make([]byte, 32) // SHA-256 is 32 bytes
-		_, err = io.ReadFull(file, baseHashBytes)
+		// Check if we're using SHA-1 (20 bytes) or SHA-256 (32 bytes)
+		// We'll try to detect by reading first and checking the zlib header
+		pos, err := file.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get current position: %w", err)
+		}
+
+		// Try SHA-1 first (most common)
+		baseHashBytes20 := make([]byte, 20) // SHA-1 is 20 bytes
+		_, err = io.ReadFull(file, baseHashBytes20)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read base hash for REF_DELTA: %w", err)
 		}
-		currentBaseHash = fmt.Sprintf("%x", baseHashBytes)
+
+		// Check if what follows is a valid zlib header
+		zlibHeader := make([]byte, 2)
+		_, err = io.ReadFull(file, zlibHeader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read zlib header: %w", err)
+		}
+
+		// Seek back to prepare for actual read
+		_, err = file.Seek(pos, io.SeekStart)
+		if err != nil {
+			return nil, fmt.Errorf("failed to reset position: %w", err)
+		}
+
+		// Determine hash format based on zlib header
+		// Valid zlib header starts with 0x78
+		if zlibHeader[0] == 0x78 {
+			// It's SHA-1 format
+			_, err = io.ReadFull(file, baseHashBytes20)
+			if err != nil {
+				return nil, fmt.Errorf("failed to re-read SHA-1 base hash: %w", err)
+			}
+			currentBaseHash = fmt.Sprintf("%x", baseHashBytes20)
+
+			// Convert to internal format
+			copy(baseHashBytes[:], baseHashBytes20)
+		} else {
+			// It's likely SHA-256 format (32 bytes)
+			baseHashBytes32 := make([]byte, 32)
+			_, err = io.ReadFull(file, baseHashBytes32)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read SHA-256 base hash: %w", err)
+			}
+			currentBaseHash = fmt.Sprintf("%x", baseHashBytes32)
+			copy(baseHashBytes[:], baseHashBytes32)
+		}
 	} else if objectType == OBJ_OFS_DELTA {
-		// currentIsDelta = true // No longer needed
 		// Read the variable-length offset for OFS_DELTA
-		// Note: The actual offset value isn't stored in the Object struct's BaseHash.
-		// The caller (ParseModernPackfile) knows the base offset from its first pass.
-		// We just need to consume these bytes from the file stream.
 		var b byte = 0x80
 		for (b & 0x80) != 0 {
 			b, err = readByte(file)
@@ -396,7 +479,6 @@ func readPackObject(file *os.File) (*Object, error) {
 				break
 			}
 		}
-		// currentBaseHash remains empty for OFS_DELTA in the Object struct
 	}
 
 	// Initialize a zlib reader to decompress the object data
@@ -427,14 +509,15 @@ func readPackObject(file *os.File) (*Object, error) {
 
 	if bytesReadSoFar != size {
 		return nil, fmt.Errorf("decompressed data size mismatch: expected %d, got %d for type %s at offset %d",
-			size, bytesReadSoFar, typeToString(objectType), startPos)
+			size, bytesReadSoFar, TypeToString(objectType), startPos)
 	}
 
 	return &Object{
-		// Hash will be filled in later by the caller for non-delta/resolved objects
-		Type:     objectType,      // Actual type (OBJ_BLOB, OBJ_REF_DELTA, etc.)
-		Data:     data,            // Decompressed data (or delta instructions)
-		BaseHash: currentBaseHash, // Populated only for OBJ_REF_DELTA
+		Type:          objectType,
+		Data:          data,
+		BaseHash:      currentBaseHash,
+		BaseHashBytes: baseHashBytes,
+		Size:          size,
 	}, nil
 }
 
@@ -452,7 +535,6 @@ func readByte(file *os.File) (byte, error) {
 }
 
 // calculateObjectHash calculates a hash for an object
-// This is a more complete implementation compared to the placeholder
 func calculateObjectHash(objType ObjectType, data []byte) string {
 	// Create the object header (e.g., "blob 12345\0")
 	var typeStr string

@@ -296,7 +296,7 @@ func getReachableObjects(storage *objects.Storage, startHash string, depth int, 
 		}
 
 		switch obj.Type {
-		case objects.ObjectTypeCommit:
+		case "commit":
 			currentDepth := processedCommits[hash]
 			if depth > 0 && currentDepth >= depth {
 				continue
@@ -318,13 +318,13 @@ func getReachableObjects(storage *objects.Storage, startHash string, depth int, 
 					toProcess = append(toProcess, treeHash)
 				}
 			}
-		case objects.ObjectTypeTree:
+		case "tree":
 			for _, entry := range extractTreeEntries(obj.Content) {
 				if isValidCommitHash(entry) && !reachable[entry] {
 					toProcess = append(toProcess, entry)
 				}
 			}
-		case objects.ObjectTypeBlob:
+		case "blob":
 			// No further processing
 		}
 	}

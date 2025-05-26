@@ -249,12 +249,23 @@ func createPackIndex(indexPath string, offsets map[string]uint64, objects []Obje
 
 		// Convert hex hash to binary
 		hashBytes, err := hex.DecodeString(obj.Hash)
-		if err != nil || len(hashBytes) != 20 {
+		if err != nil || (len(hashBytes) != 20 && len(hashBytes) != 32) {
 			return fmt.Errorf("invalid hash %s: %w", obj.Hash, err)
 		}
 
+		// For SHA-256 hashes, we need to handle the 32-byte format
+		var hashToStore []byte
+		if len(hashBytes) == 32 {
+			// Store the full 32-byte SHA-256 hash
+			hashToStore = hashBytes
+		} else {
+			// For SHA-1, pad to 32 bytes for consistency
+			hashToStore = make([]byte, 32)
+			copy(hashToStore, hashBytes)
+		}
+
 		entries = append(entries, indexEntry{
-			hash:    hashBytes,
+			hash:    hashToStore,
 			offset:  offset,
 			objType: obj.Type,
 			crc32:   0, // We're not tracking CRC32 for now
@@ -378,7 +389,7 @@ func createPackIndex(indexPath string, offsets map[string]uint64, objects []Obje
 	return nil
 }
 
-// getPackfileChecksum reads the SHA-1 checksum from the end of a packfile
+// getPackfileChecksum reads the checksum from the end of a packfile
 func getPackfileChecksum(packfilePath string) ([]byte, error) {
 	file, err := os.Open(packfilePath)
 	if err != nil {
@@ -386,13 +397,26 @@ func getPackfileChecksum(packfilePath string) ([]byte, error) {
 	}
 	defer file.Close()
 
-	// Seek to 20 bytes from the end to get the SHA-1 checksum
-	if _, err := file.Seek(-20, os.SEEK_END); err != nil {
+	// Get file size to determine checksum size
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat packfile: %w", err)
+	}
+
+	// Determine if we're using SHA-1 (20 bytes) or SHA-256 (32 bytes)
+	// This is a heuristic - we assume larger files might use SHA-256
+	checksumSize := 20               // Default to SHA-1
+	if fileInfo.Size() > 1024*1024 { // If file is larger than 1MB, assume SHA-256
+		checksumSize = 32
+	}
+
+	// Seek to the checksum position from the end
+	if _, err := file.Seek(-int64(checksumSize), os.SEEK_END); err != nil {
 		return nil, fmt.Errorf("failed to seek to checksum: %w", err)
 	}
 
-	// Read the 20-byte SHA-1 checksum
-	checksum := make([]byte, 20)
+	// Read the checksum
+	checksum := make([]byte, checksumSize)
 	if _, err := io.ReadFull(file, checksum); err != nil {
 		return nil, fmt.Errorf("failed to read checksum: %w", err)
 	}

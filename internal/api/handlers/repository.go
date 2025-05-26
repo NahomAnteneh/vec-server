@@ -10,6 +10,7 @@ import (
 
 	"github.com/NahomAnteneh/vec-server/internal/auth"
 	"github.com/NahomAnteneh/vec-server/internal/db/models"
+	"github.com/NahomAnteneh/vec-server/internal/repository"
 )
 
 // RepoResponse represents the response format for repository operations
@@ -59,6 +60,26 @@ func CreateRepository(repoService models.RepositoryService) http.HandlerFunc {
 
 		if err := repoService.Create(repo); err != nil {
 			http.Error(w, "Failed to create repository: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Get the repository manager from context and create the repository on disk
+		repoManager, ok := r.Context().Value("repoManager").(*repository.Manager)
+		if !ok {
+			http.Error(w, "Repository manager not found", http.StatusInternalServerError)
+			return
+		}
+
+		// Create the repository path and structure on disk
+		repoPath, err := repoManager.GetRepoPath(user.Username, repo.Name)
+		if err != nil {
+			http.Error(w, "Failed to determine repository path: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		repo.Path = repoPath
+
+		if err := repoManager.SyncRepository(repo, user); err != nil {
+			http.Error(w, "Failed to create repository files: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
@@ -299,12 +320,36 @@ func ForkRepository(repoService models.RepositoryService) http.HandlerFunc {
 			return
 		}
 
-		// TODO: Copy repository files using repoManager
-		// repoManager := r.Context().Value("repoManager").(*repository.Manager)
-		// if err := repoManager.CopyRepository(sourceRepo.Path, forkedRepo.Path); err != nil {
-		//     http.Error(w, "Failed to copy repository files: "+err.Error(), http.StatusInternalServerError)
-		//     return
-		// }
+		// Get repository manager and copy repository files
+		repoManager, ok := r.Context().Value("repoManager").(*repository.Manager)
+		if !ok {
+			http.Error(w, "Repository manager not found", http.StatusInternalServerError)
+			return
+		}
+
+		// Get source and target paths
+		sourceRepoPath, err := repoManager.GetRepoPath(username, repoName)
+		if err != nil {
+			http.Error(w, "Failed to determine source repository path: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		sourceRepo.Path = sourceRepoPath
+
+		forkedRepoPath, err := repoManager.GetRepoPath(user.Username, forkedRepo.Name)
+		if err != nil {
+			http.Error(w, "Failed to determine forked repository path: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		forkedRepo.Path = forkedRepoPath
+
+		// Create repository structure on disk
+		if err := repoManager.SyncRepository(forkedRepo, user); err != nil {
+			http.Error(w, "Failed to create forked repository structure: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Copy repository contents (optional in future PR)
+		// Currently just creates the basic structure
 
 		render.Status(r, http.StatusCreated)
 		render.JSON(w, r, RepoResponse{
