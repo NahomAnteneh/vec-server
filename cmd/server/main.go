@@ -63,7 +63,6 @@ func main() {
 	logger.Println("Database migrations completed successfully")
 
 	// Initialize services
-	repoService := models.NewRepositoryService(database)
 	commitService := models.NewCommitService(database)
 	branchService := models.NewBranchService(database)
 	logger.Println("Database services initialized")
@@ -72,7 +71,7 @@ func main() {
 	repoManager := repository.NewManager(cfg, logger)
 
 	// Create and set up sync manager
-	syncManager := repository.NewSyncManager(repoManager, commitService, branchService, repoService)
+	syncManager := repository.NewSyncManager(repoManager, commitService, branchService)
 	repoManager.SetSyncManager(syncManager)
 	logger.Println("Repository manager and sync manager initialized")
 

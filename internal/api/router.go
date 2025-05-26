@@ -54,6 +54,8 @@ func SetupRouter(cfg *config.Config, repoManager *repository.Manager, db *gorm.D
 	userService := models.NewUserService(db)
 	repoService := models.NewRepositoryService(db)
 	permService := models.NewPermissionService(db)
+	commitService := models.NewCommitService(db)
+	branchService := models.NewBranchService(db)
 
 	// Add services and repoManager to context
 	r.Use(func(next http.Handler) http.Handler {
@@ -61,6 +63,8 @@ func SetupRouter(cfg *config.Config, repoManager *repository.Manager, db *gorm.D
 			ctx := context.WithValue(r.Context(), "userService", userService)
 			ctx = context.WithValue(ctx, "repoService", repoService)
 			ctx = context.WithValue(ctx, "permissionService", permService)
+			ctx = context.WithValue(ctx, "commitService", commitService)
+			ctx = context.WithValue(ctx, "branchService", branchService)
 			ctx = context.WithValue(ctx, "repoManager", repoManager)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
@@ -90,8 +94,11 @@ func SetupRouter(cfg *config.Config, repoManager *repository.Manager, db *gorm.D
 			return fmt.Errorf("user not authenticated")
 		}
 
-		permService := ctx.Value("permissionService").(models.PermissionService)
-		hasPermission, err := permService.HasPermission(user.ID, repoCtx.Repository.ID, permLevel)
+		permServiceFromCtx, ok := ctx.Value("permissionService").(models.PermissionService)
+		if !ok {
+			return fmt.Errorf("permissionService not found in context")
+		}
+		hasPermission, err := permServiceFromCtx.HasPermission(user.ID, repoCtx.Repository.ID, permLevel)
 		if err != nil || !hasPermission {
 			return fmt.Errorf("permission denied")
 		}
@@ -126,13 +133,13 @@ func SetupRouter(cfg *config.Config, repoManager *repository.Manager, db *gorm.D
 			Post("/fork", handlers.ForkRepository(repoService))
 
 		// Repository content information
-		r.Get("/branches", handlers.ListBranches(repoManager))
-		r.Get("/branches/{branch}", handlers.GetBranch(repoManager))
-		r.Get("/commits", handlers.ListCommits(repoManager))
-		r.Get("/commits/{commit}", handlers.GetCommit(repoManager))
-		r.Get("/tree/{ref}", handlers.GetTreeContents(repoManager))
-		r.Get("/tree/{ref}/{path:.+}", handlers.GetTreeContents(repoManager))
-		r.Get("/blob/{ref}/{path:.+}", handlers.GetBlob(repoManager))
+		r.Get("/branches", handlers.ListBranches())
+		r.Get("/branches/{branch}", handlers.GetBranch())
+		r.Get("/commits", handlers.ListCommits())
+		r.Get("/commits/{commit}", handlers.GetCommit())
+		r.Get("/tree/{ref}", handlers.GetTreeContents())
+		r.Get("/tree/{ref}/{path:.+}", handlers.GetTreeContents())
+		r.Get("/blob/{ref}/{path:.+}", handlers.GetBlob())
 
 		// Vec Protocol endpoints
 		r.Get("/info/refs", protocol.InfoRefsHandler(repoManager, logger))

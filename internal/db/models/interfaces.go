@@ -33,10 +33,12 @@ type PermissionService interface {
 
 // CommitService defines the interface for commit operations
 type CommitService interface {
-	Create(commit *Commit) error
-	GetByHash(repoID uint, hash string) (*Commit, error)
-	ListByRepository(repoID uint, limit, offset int) ([]*Commit, error)
-	GetCommitCount(repoID uint) (int64, error)
+	CreateCommit(commit *Commit) error
+	GetCommitByHash(repoID uint, commitID string) (*Commit, error)
+	GetCommitsByRepoID(repoID uint) ([]*Commit, error)
+	AddCommitParent(commit *Commit, parent *Commit) error
+	GetCommitParents(commitID string) ([]*Commit, error)
+	GetCommitChildren(commitID string) ([]*Commit, error)
 }
 
 // BranchService defines the interface for branch operations

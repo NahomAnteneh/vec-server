@@ -1,73 +1,60 @@
 package packfile
 
-import (
-	"encoding/hex"
-	"fmt"
-)
+import "fmt"
 
 // Constants
 const (
-	hashLength    = 32 // SHA-256 hash length in bytes
-	hexHashLength = 64 // SHA-256 hash length in hex form (32 bytes represented as 64 hex characters)
-
-	// Object type bits in packed format
-	TYPE_OFS_DELTA = 6 // Delta with offset to base
-	TYPE_REF_DELTA = 7 // Delta with reference to base
+	hashLength     = 32 // SHA-256 hash length in bytes
+	hexHashLength  = 64 // SHA-256 hash length in hex form
+	TYPE_OFS_DELTA = 6  // Delta with offset to base
+	TYPE_REF_DELTA = 7  // Delta with reference to base
 )
 
 // ObjectType represents the type of an object in the packfile
 type ObjectType byte
 
 const (
-	// Standard object types in Git
-	OBJ_NONE   ObjectType = 0 // Not a valid object type
-	OBJ_COMMIT ObjectType = 1 // Commit object
-	OBJ_TREE   ObjectType = 2 // Tree object
-	OBJ_BLOB   ObjectType = 3 // Blob (file) object
-	OBJ_TAG    ObjectType = 4 // Tag object
-
-	// Reserved for future use
-	OBJ_OFS_DELTA ObjectType = 6 // Delta with offset to base
-	OBJ_REF_DELTA ObjectType = 7 // Delta with reference to base
-
-	// Our custom object type for internal use only
-	OBJ_DELTA ObjectType = 100 // Delta object (for internal representation)
+	OBJ_NONE      ObjectType = 0   // Not a valid object type
+	OBJ_COMMIT    ObjectType = 1   // Commit object
+	OBJ_TREE      ObjectType = 2   // Tree object
+	OBJ_BLOB      ObjectType = 3   // Blob (file) object
+	OBJ_TAG       ObjectType = 4   // Tag object
+	OBJ_OFS_DELTA ObjectType = 6   // Delta with offset to base
+	OBJ_REF_DELTA ObjectType = 7   // Delta with reference to base
+	OBJ_DELTA     ObjectType = 100 // Internal delta representation
 )
 
-// Object represents a parsed object from a packfile.
+// Object represents a parsed object from a packfile
 type Object struct {
 	Hash          string           // SHA-256 hash in hex format
 	HashBytes     [hashLength]byte // SHA-256 hash in bytes
 	Type          ObjectType       // Object type
 	Data          []byte           // Object data
-	BaseHash      string           // Hash of base object (if this is a delta)
+	BaseHash      string           // Hash of base object (if delta)
 	BaseHashBytes [hashLength]byte // Base hash in bytes (if delta)
 	Offset        int64            // Offset in packfile
 	Size          uint64           // Size of object data
-	BaseIndex     int              // Index of base object in objects array (if OFS_DELTA)
+	BaseIndex     int              // Index of base object in p.Objects array (if OFS_DELTA)
 }
 
-// DeltaObject represents a delta object with a base object hash and delta instructions
+// DeltaObject represents a delta-compressed object
 type DeltaObject struct {
-	BaseHash      string           // Hash of the base object
+	BaseHash      string           // Hash of base object
 	BaseHashBytes [hashLength]byte // Base hash in bytes
-	Hash          string           // Hash of the resulting object after applying delta
+	Hash          string           // Hash of resulting object
 	HashBytes     [hashLength]byte // Resulting hash in bytes
-	Type          ObjectType       // Type of the final object (inherited from base)
+	Type          ObjectType       // Type of final object
 	Delta         []byte           // Delta instructions
 	TargetSize    uint64           // Size of reconstructed object
 }
 
 // PackfileIndex represents an index for a packfile
 type PackfileIndex struct {
-	Version      uint32                    // Index format version
-	Entries      map[string]PackIndexEntry // Map from hash to entry
-	Checksum     []byte                    // SHA-256 checksum of the packfile
-	Fanout       [256]uint32               // Fanout table
-	Offsets      []uint32                  // Object offsets
-	Hashes       [][hashLength]byte        // Object hashes
-	CRCs         []uint32                  // CRC32 checksums
-	PackChecksum [hashLength]byte          // Packfile checksum
+	Fanout       [256]uint32        // Fanout table
+	Offsets      []uint32           // Object offsets
+	Hashes       [][hashLength]byte // Object hashes
+	CRCs         []uint32           // CRC32 checksums
+	PackChecksum [hashLength]byte   // Packfile checksum
 }
 
 // PackIndexEntry stores information about an object in the packfile
@@ -75,17 +62,17 @@ type PackIndexEntry struct {
 	Offset uint64     // Offset in the packfile
 	Type   ObjectType // Object type
 	Size   uint64     // Size of the object data
-	CRC32  uint32     // CRC32 checksum (optional)
+	CRC32  uint32     // CRC32 checksum
 }
 
 // PackFileHeader represents the header of a packfile
 type PackFileHeader struct {
 	Signature  [4]byte // Should be "PACK"
-	Version    uint32  // Pack format version (currently 2)
-	NumObjects uint32  // Number of objects in the pack
+	Version    uint32  // Pack format version (2)
+	NumObjects uint32  // Number of objects
 }
 
-// TypeToString converts an ObjectType to its string representation
+// typeToString converts an ObjectType to its string representation
 func TypeToString(objType ObjectType) string {
 	switch objType {
 	case OBJ_COMMIT:
@@ -105,7 +92,7 @@ func TypeToString(objType ObjectType) string {
 	}
 }
 
-// StringToType converts a string type name to ObjectType
+// stringToType converts a string type name to ObjectType
 func StringToType(typeName string) ObjectType {
 	switch typeName {
 	case "commit":
@@ -121,30 +108,4 @@ func StringToType(typeName string) ObjectType {
 	default:
 		return OBJ_NONE
 	}
-}
-
-// For backward compatibility
-func typeToString(objType ObjectType) string {
-	return TypeToString(objType)
-}
-
-// For backward compatibility
-func stringToType(typeName string) ObjectType {
-	return StringToType(typeName)
-}
-
-// Helper function to convert hex string to byte array
-func hexToBytes(hexStr string) ([hashLength]byte, error) {
-	var result [hashLength]byte
-	if len(hexStr) != hexHashLength {
-		return result, fmt.Errorf("invalid hash length: expected %d, got %d", hexHashLength, len(hexStr))
-	}
-
-	bytes, err := hex.DecodeString(hexStr)
-	if err != nil {
-		return result, err
-	}
-
-	copy(result[:], bytes)
-	return result, nil
 }

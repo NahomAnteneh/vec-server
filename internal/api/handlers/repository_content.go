@@ -7,19 +7,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/render"
-
 	"github.com/NahomAnteneh/vec-server/core"
-	"github.com/NahomAnteneh/vec-server/internal/api/middleware"
-	"github.com/NahomAnteneh/vec-server/internal/auth"
 	"github.com/NahomAnteneh/vec-server/internal/db/models"
 	"github.com/NahomAnteneh/vec-server/internal/repository"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/render"
 )
 
 // CommitResponse represents a commit in the API response
 type CommitResponse struct {
 	Hash           string    `json:"hash"`
+	TreeHash       string    `json:"tree_hash,omitempty"`
 	Author         string    `json:"author"`
 	AuthorEmail    string    `json:"author_email"`
 	CommitterName  string    `json:"committer_name,omitempty"`
@@ -60,8 +58,13 @@ type FileContentResponse struct {
 }
 
 // ListBranches returns a list of all branches in the repository
-func ListBranches(repoManager *repository.Manager) http.HandlerFunc {
+func ListBranches() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		repoManager, ok := r.Context().Value("repoManager").(*repository.Manager)
+		if !ok || repoManager == nil {
+			http.Error(w, "Repository manager not found in context", http.StatusInternalServerError)
+			return
+		}
 		repoCtx := getRepositoryContext(r)
 		if repoCtx == nil {
 			http.Error(w, "Repository context not found", http.StatusInternalServerError)
@@ -74,35 +77,48 @@ func ListBranches(repoManager *repository.Manager) http.HandlerFunc {
 			return
 		}
 
-		refs, err := repoManager.GetRefs(repo)
+		// Initialize headCommitHash before use
+		var headCommitHash string
+		headCommitHash, err := repoManager.GetHeadCommitHash(repo.Path)
 		if err != nil {
-			http.Error(w, "Failed to list branches: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		// Get current branch
-		headRef, err := repoManager.GetRef(repo, "HEAD")
-		if err != nil {
-			http.Error(w, "Failed to get HEAD reference: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		headBranch := ""
-		if headRef != nil && strings.HasPrefix(headRef.Value, "ref: refs/heads/") {
-			headBranch = strings.TrimPrefix(headRef.Value, "ref: refs/heads/")
-		}
-
-		branches := make([]BranchResponse, 0)
-		for refName, target := range refs {
-			if strings.HasPrefix(refName, "refs/heads/") {
-				branchName := strings.TrimPrefix(refName, "refs/heads/")
-				branch := BranchResponse{
-					Name:   branchName,
-					Target: target,
-					IsHead: branchName == headBranch,
-				}
-				branches = append(branches, branch)
+			// Log error, but proceed. HEAD might be unresolvable in some states (e.g. empty repo before first commit)
+			// Consider if this should be a hard error.
+			// For now, if HEAD is unresolvable, no branch will be marked as IsHead unless it matches a symbolic ref to a known branch head.
+			if headCommitHash == "" && err != nil { // If GetHeadCommitHash failed, ensure headCommitHash is explicitly empty for logic below
+				headCommitHash = "" // or some other indicator that it's unresolved
 			}
+		}
+
+		// Determine the current symbolic HEAD target (e.g. "refs/heads/main")
+		cr := core.NewRepository(repo.Path)         // Create core.Repository instance
+		symbolicHeadRef, _ := core.ReadHEADFile(cr) // Ignores error, if HEAD is detached or invalid, headBranch remains empty
+		headBranchName := ""
+		if strings.HasPrefix(symbolicHeadRef, "ref: refs/heads/") {
+			headBranchName = strings.TrimPrefix(symbolicHeadRef, "ref: refs/heads/")
+		}
+
+		branchMap, branchErr := repoManager.GetBranches(repo.Path)
+		if branchErr != nil {
+			http.Error(w, "Failed to list branches: "+branchErr.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		branches := make([]BranchResponse, 0, len(branchMap))
+		for name, commitHash := range branchMap {
+			commitDetails, err := getCommitDetails(repo.Path, commitHash) // Fetch commit details for LastCommit
+			if err != nil {
+				// Log this error but continue, or skip this branch in the response
+				// For now, we'll add the branch without commit details if this fails.
+				commitDetails = nil // Or a new empty CommitResponse
+			}
+
+			branch := BranchResponse{
+				Name:       name,
+				Target:     commitHash,
+				IsHead:     (name == headBranchName) || (commitHash == headCommitHash && headBranchName == ""), // Branch is HEAD if its name matches symbolic HEAD, or if its commit matches detached HEAD's commit and no symbolic HEAD branch
+				LastCommit: commitDetails,
+			}
+			branches = append(branches, branch)
 		}
 
 		render.JSON(w, r, map[string]interface{}{
@@ -113,8 +129,13 @@ func ListBranches(repoManager *repository.Manager) http.HandlerFunc {
 }
 
 // GetBranch returns details about a specific branch
-func GetBranch(repoManager *repository.Manager) http.HandlerFunc {
+func GetBranch() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		repoManager, ok := r.Context().Value("repoManager").(*repository.Manager)
+		if !ok || repoManager == nil {
+			http.Error(w, "Repository manager not found in context", http.StatusInternalServerError)
+			return
+		}
 		repoCtx := getRepositoryContext(r)
 		if repoCtx == nil {
 			http.Error(w, "Repository context not found", http.StatusInternalServerError)
@@ -133,24 +154,30 @@ func GetBranch(repoManager *repository.Manager) http.HandlerFunc {
 			return
 		}
 
-		refName := "refs/heads/" + branchName
-		ref, err := repoManager.GetRef(repo, refName)
+		commitHash, err := repoManager.GetCommitForBranch(repo.Path, branchName)
 		if err != nil {
 			http.Error(w, "Branch not found: "+err.Error(), http.StatusNotFound)
 			return
 		}
 
-		headRef, _ := repoManager.GetRef(repo, "HEAD")
+		actualHeadCommitHash, _ := repoManager.GetHeadCommitHash(repo.Path)
+		// core.ReadHEADFile now expects *core.Repository
+		cr := core.NewRepository(repo.Path) // Create core.Repository instance
+		symbolicHeadRef, _ := core.ReadHEADFile(cr)
 		isHead := false
-		if headRef != nil && strings.HasPrefix(headRef.Value, "ref: refs/heads/") {
-			headBranch := strings.TrimPrefix(headRef.Value, "ref: refs/heads/")
-			isHead = headBranch == branchName
+		if strings.HasPrefix(symbolicHeadRef, "ref: refs/heads/") {
+			isHead = (strings.TrimPrefix(symbolicHeadRef, "ref: refs/heads/") == branchName)
+		} else if symbolicHeadRef == commitHash { // Detached HEAD (symbolicHeadRef is a commit hash)
+			isHead = true
+		} else if actualHeadCommitHash == commitHash && !strings.HasPrefix(symbolicHeadRef, "ref: refs/heads/") {
+			// Covers cases where HEAD is detached and points to the current branch's commit,
+			// and symbolicHeadRef itself wasn't a direct hash match to commitHash (already covered).
+			isHead = true
 		}
 
-		commitHash := ref.Value
-		commit, err := getCommitDetails(repo.Path, commitHash)
-		if err != nil {
-			http.Error(w, "Failed to get commit details: "+err.Error(), http.StatusInternalServerError)
+		commitDetails, detailsErr := getCommitDetails(repo.Path, commitHash)
+		if detailsErr != nil {
+			http.Error(w, "Failed to get commit details: "+detailsErr.Error(), http.StatusInternalServerError)
 			return
 		}
 
@@ -158,7 +185,7 @@ func GetBranch(repoManager *repository.Manager) http.HandlerFunc {
 			Name:       branchName,
 			Target:     commitHash,
 			IsHead:     isHead,
-			LastCommit: commit,
+			LastCommit: commitDetails,
 		}
 
 		render.JSON(w, r, branch)
@@ -166,8 +193,13 @@ func GetBranch(repoManager *repository.Manager) http.HandlerFunc {
 }
 
 // ListCommits returns a list of commits in the repository
-func ListCommits(repoManager *repository.Manager) http.HandlerFunc {
+func ListCommits() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		repoManager, ok := r.Context().Value("repoManager").(*repository.Manager)
+		if !ok || repoManager == nil {
+			http.Error(w, "Repository manager not found in context", http.StatusInternalServerError)
+			return
+		}
 		repoCtx := getRepositoryContext(r)
 		if repoCtx == nil {
 			http.Error(w, "Repository context not found", http.StatusInternalServerError)
@@ -180,87 +212,116 @@ func ListCommits(repoManager *repository.Manager) http.HandlerFunc {
 			return
 		}
 
-		refName := r.URL.Query().Get("ref")
-		if refName == "" {
-			// Default to HEAD
-			headRef, err := repoManager.GetRef(repo, "HEAD")
-			if err == nil && headRef != nil {
-				if strings.HasPrefix(headRef.Value, "ref: ") {
-					refName = strings.TrimPrefix(headRef.Value, "ref: ")
-				} else {
-					refName = "HEAD"
-				}
+		branchService, ok := r.Context().Value("branchService").(models.BranchService)
+		if !ok {
+			http.Error(w, "Branch service not found", http.StatusInternalServerError)
+			return
+		}
+
+		refName := r.URL.Query().Get("ref") // Can be branch name, commit hash, or empty (defaults to HEAD)
+		startCommitHash := ""
+
+		if refName == "" || refName == "HEAD" {
+			// Try to get default branch's head commit from DB first
+			dbDefaultBranch, err := branchService.GetDefaultBranch(repo.ID)
+			if err == nil && dbDefaultBranch != nil {
+				startCommitHash = dbDefaultBranch.CommitID
 			} else {
-				refName = "HEAD"
+				// Fallback to repoManager for HEAD if not in DB or no default branch
+				fsHeadCommit, errFs := repoManager.GetHeadCommitHash(repo.Path)
+				if errFs == nil && fsHeadCommit != "" {
+					startCommitHash = fsHeadCommit
+				} else {
+					http.Error(w, "Failed to determine starting commit for HEAD", http.StatusNotFound)
+					return
+				}
 			}
-		}
-
-		limit := 20
-		if limitParam := r.URL.Query().Get("limit"); limitParam != "" {
-			if parsedLimit, err := strconv.Atoi(limitParam); err == nil && parsedLimit > 0 {
-				limit = parsedLimit
-			}
-		}
-
-		page := 1
-		if pageParam := r.URL.Query().Get("page"); pageParam != "" {
-			if parsedPage, err := strconv.Atoi(pageParam); err == nil && parsedPage > 0 {
-				page = parsedPage
-			}
-		}
-
-		// TODO: Implement proper commit listing with pagination
-		// This is a placeholder until we implement proper commit traversal
-		commits := make([]*CommitResponse, 0)
-
-		refObj, err := repoManager.GetRef(repo, refName)
-		if err != nil || refObj == nil {
-			// If refName is not a ref, try it directly as a commit hash
-			commit, err := getCommitDetails(repo.Path, refName)
-			if err != nil {
-				http.Error(w, "Reference not found: "+err.Error(), http.StatusNotFound)
-				return
-			}
-			commits = append(commits, commit)
+		} else if isValidCommitHash(refName) { // Direct commit hash
+			startCommitHash = refName
 		} else {
-			// Get commit from ref
-			commitHash := refObj.Value
-			commit, err := getCommitDetails(repo.Path, commitHash)
-			if err != nil {
-				http.Error(w, "Failed to get commit details: "+err.Error(), http.StatusInternalServerError)
-				return
+			// Assume refName is a branch name
+			dbBranch, err := branchService.GetByName(repo.ID, refName)
+			if err == nil && dbBranch != nil {
+				startCommitHash = dbBranch.CommitID
+			} else {
+				// Fallback: check filesystem for branch if not in DB (though it should be if synced)
+				fsBranchCommit, errFs := repoManager.GetCommitForBranch(repo.Path, refName)
+				if errFs == nil && fsBranchCommit != "" {
+					startCommitHash = fsBranchCommit
+				} else {
+					http.Error(w, fmt.Sprintf("Ref '%s' not found", refName), http.StatusNotFound)
+					return
+				}
 			}
-			commits = append(commits, commit)
+		}
 
-			// Add parent commits if available
-			for i := 0; i < limit-1 && i < len(commits); i++ {
-				for _, parentHash := range commits[i].ParentHashes {
-					parentCommit, err := getCommitDetails(repo.Path, parentHash)
-					if err == nil {
-						commits = append(commits, parentCommit)
-						if len(commits) >= limit {
-							break
-						}
-					}
+		if startCommitHash == "" {
+			http.Error(w, "Could not determine starting commit for listing.", http.StatusInternalServerError)
+			return
+		}
+
+		// Pagination parameters
+		limitStr := r.URL.Query().Get("limit")
+		limit := 20 // Default limit
+		if limitStr != "" {
+			if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+				if l > 100 { // Max limit
+					l = 100
 				}
-				if len(commits) >= limit {
-					break
-				}
+				limit = l
 			}
+		}
+
+		// Use core.FindReachableObjects to get commit history hashes
+		cr := core.NewRepository(repo.Path)
+		// core.FindReachableObjects now returns []string (hashes) and takes only repo and startCommitHash
+		commitHashes, err := core.FindReachableObjects(cr, startCommitHash)
+		if err != nil {
+			// Check if the error is because the startCommitHash was not found in core
+			if core.IsErrNotFound(err) {
+				http.Error(w, fmt.Sprintf("Commit '%s' not found in repository history", startCommitHash), http.StatusNotFound)
+			} else {
+				http.Error(w, "Failed to retrieve commits: "+err.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
+
+		commitResponses := make([]CommitResponse, 0, len(commitHashes))
+		// Apply limit after fetching all reachable, or modify FindReachableObjects if it can support limit
+		numToProcess := len(commitHashes)
+		if limit < numToProcess {
+			numToProcess = limit
+		}
+
+		for i := 0; i < numToProcess; i++ {
+			commitHash := commitHashes[i]
+			// Convert core.Commit (obtained via getCommitDetails) to CommitResponse
+			// getCommitDetails already handles calling core.GetCommit(repo.Path, commitHash)
+			commitDetail, err := getCommitDetails(repo.Path, commitHash)
+			if err != nil {
+				// Log error and potentially skip this commit in the response
+				// Placeholder for logging: log.Printf("Error getting details for commit %s: %v", commitHash, err)
+				continue
+			}
+			commitResponses = append(commitResponses, *commitDetail) // commitDetail is already a *CommitResponse
 		}
 
 		render.JSON(w, r, map[string]interface{}{
-			"commits": commits,
-			"count":   len(commits),
-			"page":    page,
-			"limit":   limit,
+			"commits": commitResponses,
+			"count":   len(commitResponses),
+			// TODO: Add pagination info (next_cursor, etc.) if FindReachableObjects supports it
 		})
 	}
 }
 
 // GetCommit returns details about a specific commit
-func GetCommit(repoManager *repository.Manager) http.HandlerFunc {
+func GetCommit() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		repoManager, ok := r.Context().Value("repoManager").(*repository.Manager)
+		if !ok || repoManager == nil {
+			http.Error(w, "Repository manager not found in context", http.StatusInternalServerError)
+			return
+		}
 		repoCtx := getRepositoryContext(r)
 		if repoCtx == nil {
 			http.Error(w, "Repository context not found", http.StatusInternalServerError)
@@ -290,8 +351,13 @@ func GetCommit(repoManager *repository.Manager) http.HandlerFunc {
 }
 
 // GetTreeContents returns the contents of a tree
-func GetTreeContents(repoManager *repository.Manager) http.HandlerFunc {
+func GetTreeContents() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		repoManager, ok := r.Context().Value("repoManager").(*repository.Manager)
+		if !ok || repoManager == nil {
+			http.Error(w, "Repository manager not found in context", http.StatusInternalServerError)
+			return
+		}
 		repoCtx := getRepositoryContext(r)
 		if repoCtx == nil {
 			http.Error(w, "Repository context not found", http.StatusInternalServerError)
@@ -306,35 +372,57 @@ func GetTreeContents(repoManager *repository.Manager) http.HandlerFunc {
 
 		ref := chi.URLParam(r, "ref")
 		if ref == "" {
-			http.Error(w, "Reference is required", http.StatusBadRequest)
-			return
+			// Default to HEAD if ref is not provided
+			ref = "HEAD"
 		}
 
 		path := chi.URLParam(r, "path")
 
-		// Get commit hash from ref
-		commitHash := ref
-		if !isValidCommitHash(ref) {
-			refObj, err := repoManager.GetRef(repo, "refs/heads/"+ref)
+		var commitHash string
+		var err error
+
+		// Resolve ref to a commit hash
+		if isValidCommitHash(ref) {
+			commitHash = ref
+		} else if ref == "HEAD" {
+			commitHash, err = repoManager.GetHeadCommitHash(repo.Path)
 			if err != nil {
-				// Try other refs
-				refObj, err = repoManager.GetRef(repo, ref)
+				http.Error(w, "Failed to resolve HEAD: "+err.Error(), http.StatusNotFound)
+				return
+			}
+		} else {
+			// Try as a branch name using BranchService first
+			branchService, ok := r.Context().Value("branchService").(models.BranchService)
+			if !ok {
+				http.Error(w, "Branch service not found", http.StatusInternalServerError)
+				return
+			}
+			dbBranch, dbErr := branchService.GetByName(repo.ID, ref)
+			if dbErr == nil && dbBranch != nil {
+				commitHash = dbBranch.CommitID
+			} else {
+				// Fallback to repoManager for branch lookup if not in DB or error
+				commitHash, err = repoManager.GetCommitForBranch(repo.Path, ref)
 				if err != nil {
-					http.Error(w, "Reference not found: "+err.Error(), http.StatusNotFound)
+					http.Error(w, fmt.Sprintf("Reference '%s' not found: %s", ref, err.Error()), http.StatusNotFound)
 					return
 				}
 			}
-			commitHash = refObj.Value
 		}
 
-		// Get tree from commit
-		commit, err := core.GetCommit(repo.Path, commitHash)
-		if err != nil {
-			http.Error(w, "Invalid commit reference", http.StatusBadRequest)
+		if commitHash == "" {
+			http.Error(w, "Could not resolve reference to a commit", http.StatusInternalServerError)
 			return
 		}
 
-		treeHash := commit.Tree
+		// Get tree from commit
+		commitDetails, err := getCommitDetails(repo.Path, commitHash)
+		if err != nil {
+			http.Error(w, "Invalid commit reference: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		treeHash := commitDetails.TreeHash // Use TreeHash from parsed commit details
 
 		// If path is specified, navigate to that directory
 		if path != "" {
@@ -386,9 +474,14 @@ func GetTreeContents(repoManager *repository.Manager) http.HandlerFunc {
 	}
 }
 
-// GetBlob returns the contents of a blob
-func GetBlob(repoManager *repository.Manager) http.HandlerFunc {
+// GetBlob returns the content of a blob (file)
+func GetBlob() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		repoManager, ok := r.Context().Value("repoManager").(*repository.Manager)
+		if !ok || repoManager == nil {
+			http.Error(w, "Repository manager not found in context", http.StatusInternalServerError)
+			return
+		}
 		repoCtx := getRepositoryContext(r)
 		if repoCtx == nil {
 			http.Error(w, "Repository context not found", http.StatusInternalServerError)
@@ -401,109 +494,117 @@ func GetBlob(repoManager *repository.Manager) http.HandlerFunc {
 			return
 		}
 
-		ref := chi.URLParam(r, "ref")
-		if ref == "" {
-			http.Error(w, "Reference is required", http.StatusBadRequest)
-			return
+		refParam := chi.URLParam(r, "ref") // Changed from "ref" to "refParam" to avoid conflict
+		if refParam == "" {
+			refParam = "HEAD" // Default to HEAD
 		}
-
-		path := chi.URLParam(r, "path")
-		if path == "" {
+		filePath := chi.URLParam(r, "path") // Changed from "path" to "filePath"
+		if filePath == "" {
 			http.Error(w, "File path is required", http.StatusBadRequest)
 			return
 		}
 
-		// Get commit hash from ref
-		commitHash := ref
-		if !isValidCommitHash(ref) {
-			refObj, err := repoManager.GetRef(repo, "refs/heads/"+ref)
+		var commitHash string
+		var err error
+
+		// 1. Resolve refParam to a commitHash
+		if isValidCommitHash(refParam) {
+			commitHash = refParam
+		} else if refParam == "HEAD" {
+			commitHash, err = repoManager.GetHeadCommitHash(repo.Path)
 			if err != nil {
-				// Try other refs
-				refObj, err = repoManager.GetRef(repo, ref)
+				http.Error(w, "Failed to resolve HEAD: "+err.Error(), http.StatusNotFound)
+				return
+			}
+		} else {
+			branchService, ok := r.Context().Value("branchService").(models.BranchService)
+			if !ok {
+				http.Error(w, "Branch service not found", http.StatusInternalServerError)
+				return
+			}
+			dbBranch, dbErr := branchService.GetByName(repo.ID, refParam)
+			if dbErr == nil && dbBranch != nil {
+				commitHash = dbBranch.CommitID
+			} else {
+				commitHash, err = repoManager.GetCommitForBranch(repo.Path, refParam)
 				if err != nil {
-					http.Error(w, "Reference not found: "+err.Error(), http.StatusNotFound)
+					http.Error(w, fmt.Sprintf("Reference '%s' not found: %s", refParam, err.Error()), http.StatusNotFound)
 					return
 				}
 			}
-			commitHash = refObj.Value
 		}
-
-		// Get tree from commit
-		commit, err := core.GetCommit(repo.Path, commitHash)
-		if err != nil {
-			http.Error(w, "Invalid commit reference", http.StatusBadRequest)
+		if commitHash == "" {
+			http.Error(w, "Could not resolve reference to a commit", http.StatusInternalServerError)
 			return
 		}
 
-		treeHash := commit.Tree
+		// 2. Get root treeHash from commit
+		commitDetails, err := getCommitDetails(repo.Path, commitHash)
+		if err != nil {
+			http.Error(w, "Failed to get commit details: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		currentTreeHash := commitDetails.TreeHash
 
-		// Navigate to the file
-		pathParts := strings.Split(path, "/")
+		// 3. Traverse filePath to find blob hash
+		pathParts := strings.Split(strings.Trim(filePath, "/"), "/")
+		var blobHash string
 		fileName := pathParts[len(pathParts)-1]
-		dirPath := strings.Join(pathParts[:len(pathParts)-1], "/")
 
-		// Navigate through directories if needed
-		if dirPath != "" {
-			dirParts := strings.Split(dirPath, "/")
-			currentTreeHash := treeHash
-
-			for _, part := range dirParts {
-				entries, err := getTreeEntries(repo.Path, currentTreeHash)
-				if err != nil {
-					http.Error(w, "Failed to read tree: "+err.Error(), http.StatusInternalServerError)
-					return
-				}
-
-				found := false
-				for _, entry := range entries {
-					if entry.Name == part && entry.Type == "tree" {
-						currentTreeHash = entry.Hash
-						found = true
-						break
+		for i, partName := range pathParts {
+			treeEntries, err := getTreeEntries(repo.Path, currentTreeHash)
+			if err != nil {
+				http.Error(w, "Failed to read tree contents: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			foundEntry := false
+			for _, entry := range treeEntries {
+				if entry.Name == partName {
+					if i == len(pathParts)-1 { // Last part of the path
+						if entry.Type == "blob" {
+							blobHash = entry.Hash
+						} else {
+							http.Error(w, fmt.Sprintf("Path '%s' is a directory, not a file", filePath), http.StatusBadRequest)
+							return
+						}
+					} else { // Intermediate part of the path
+						if entry.Type == "tree" {
+							currentTreeHash = entry.Hash
+						} else {
+							http.Error(w, fmt.Sprintf("Path component '%s' in '%s' is not a directory", partName, filePath), http.StatusBadRequest)
+							return
+						}
 					}
-				}
-
-				if !found {
-					http.Error(w, "Directory not found: "+dirPath, http.StatusNotFound)
-					return
+					foundEntry = true
+					break
 				}
 			}
-
-			treeHash = currentTreeHash
-		}
-
-		// Find the file in the tree
-		entries, err := getTreeEntries(repo.Path, treeHash)
-		if err != nil {
-			http.Error(w, "Failed to read tree: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		var fileHash string
-		fileFound := false
-		for _, entry := range entries {
-			if entry.Name == fileName && entry.Type == "blob" {
-				fileHash = entry.Hash
-				fileFound = true
-				break
+			if !foundEntry {
+				http.Error(w, fmt.Sprintf("Path '%s' not found in repository", filePath), http.StatusNotFound)
+				return
 			}
 		}
 
-		if !fileFound {
-			http.Error(w, "File not found: "+fileName, http.StatusNotFound)
+		if blobHash == "" {
+			http.Error(w, fmt.Sprintf("File '%s' not found at the specified path", filePath), http.StatusNotFound)
 			return
 		}
 
-		// Read blob content
-		content, err := core.GetBlob(repo.Path, fileHash)
+		// 4. Read blob content using core.ReadObject
+		cr := core.NewRepository(repo.Path)                         // Create a core.Repository instance
+		objType, contentBytes, err := core.ReadObject(cr, blobHash) // Pass 'cr'
 		if err != nil {
 			http.Error(w, "Failed to read file content: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
+		if objType != "blob" {
+			http.Error(w, "Expected a blob object but found "+objType, http.StatusInternalServerError)
+			return
+		}
 
-		// Check if content is binary
+		// Existing binary detection and response logic
 		isBinary := false
-		for _, b := range content {
+		for _, b := range contentBytes {
 			if b == 0 {
 				isBinary = true
 				break
@@ -512,145 +613,19 @@ func GetBlob(repoManager *repository.Manager) http.HandlerFunc {
 
 		response := FileContentResponse{
 			Name:   fileName,
-			Path:   path,
-			Hash:   fileHash,
-			Size:   len(content),
+			Path:   filePath,
+			Hash:   blobHash,
+			Size:   len(contentBytes),
 			Binary: isBinary,
 		}
 
 		if !isBinary {
-			response.Content = string(content)
+			response.Content = string(contentBytes)
+			render.JSON(w, r, response)
 		} else {
-			// For binary content, return base64 or handle appropriately
 			w.Header().Set("Content-Type", "application/octet-stream")
 			w.Header().Set("Content-Disposition", "attachment; filename="+fileName)
-			w.Write(content)
-			return
-		}
-
-		render.JSON(w, r, response)
-	}
-}
-
-// Helper functions
-
-// getRepositoryContext retrieves repository context from the request
-func getRepositoryContext(r *http.Request) *middleware.RepositoryContext {
-	repoCtx, ok := r.Context().Value(middleware.RepositoryContextKey).(*middleware.RepositoryContext)
-	if !ok || repoCtx == nil {
-		return nil
-	}
-	return repoCtx
-}
-
-// canAccessRepository checks if the user can access the repository
-func canAccessRepository(r *http.Request, repo *models.Repository) bool {
-	if repo.IsPublic {
-		return true
-	}
-
-	user := auth.GetUserFromContext(r.Context())
-	if user == nil {
-		return false
-	}
-
-	if user.ID == repo.OwnerID {
-		return true
-	}
-
-	permService, ok := r.Context().Value("permissionService").(models.PermissionService)
-	if !ok {
-		return false
-	}
-
-	hasAccess, _ := permService.HasPermission(user.ID, repo.ID, models.ReadPermission)
-	return hasAccess
-}
-
-// isValidCommitHash checks if a string is a valid commit hash
-func isValidCommitHash(hash string) bool {
-	if len(hash) != 64 {
-		return false
-	}
-
-	for _, c := range hash {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
-			return false
+			w.Write(contentBytes)
 		}
 	}
-
-	return true
-}
-
-// getAuthorParts splits an author string into name and email
-func getAuthorParts(authorStr string) (name, email string) {
-	parts := strings.Split(authorStr, " <")
-	if len(parts) < 2 {
-		return authorStr, ""
-	}
-
-	name = parts[0]
-	email = strings.TrimSuffix(parts[1], ">")
-	return
-}
-
-// getCommitTime parses a timestamp into a time
-func getCommitTime(timestamp int64) time.Time {
-	return time.Unix(timestamp, 0)
-}
-
-// getCommitDetails retrieves details about a commit
-func getCommitDetails(repoPath, commitHash string) (*CommitResponse, error) {
-	commit, err := core.GetCommit(repoPath, commitHash)
-	if err != nil {
-		return nil, err
-	}
-
-	authorName, authorEmail := getAuthorParts(commit.Author)
-	committerName, committerEmail := getAuthorParts(commit.Committer)
-
-	return &CommitResponse{
-		Hash:           commitHash,
-		Author:         authorName,
-		AuthorEmail:    authorEmail,
-		CommitterName:  committerName,
-		CommitterEmail: committerEmail,
-		Message:        commit.Message,
-		ShortMessage:   getShortMessage(commit.Message),
-		ParentHashes:   commit.Parents,
-		CommitDate:     getCommitTime(commit.Timestamp),
-		AuthorDate:     getCommitTime(commit.Timestamp), // Using same timestamp for author/commit dates
-	}, nil
-}
-
-// getShortMessage returns the first line of a commit message
-func getShortMessage(message string) string {
-	lines := strings.Split(message, "\n")
-	if len(lines) > 0 {
-		return lines[0]
-	}
-	return message
-}
-
-// getTreeEntries retrieves entries in a tree
-func getTreeEntries(repoPath, treeHash string) ([]TreeEntryResponse, error) {
-	tree, err := core.GetTree(repoPath, treeHash)
-	if err != nil {
-		return nil, err
-	}
-
-	entries := make([]TreeEntryResponse, 0, len(tree.Entries))
-	for _, entry := range tree.Entries {
-		modeStr := fmt.Sprintf("%o", entry.Mode)
-
-		entries = append(entries, TreeEntryResponse{
-			Name: entry.Name,
-			Path: entry.Name,
-			Type: entry.Type,
-			Mode: modeStr,
-			Hash: entry.Hash,
-		})
-	}
-
-	return entries, nil
 }

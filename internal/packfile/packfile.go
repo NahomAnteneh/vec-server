@@ -4,198 +4,299 @@ import (
 	"bytes"
 	"compress/zlib"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 
 	"github.com/NahomAnteneh/vec-server/core"
 )
 
-// FinalizePackfile prepares a packfile for transmission by adding checksums and other metadata
-func FinalizePackfile(packfile []byte) []byte {
-	// Calculate the SHA-256 checksum of the packfile content
+// Packfile represents a packfile with its objects and index
+type Packfile struct {
+	Repo     *core.Repository
+	Header   PackFileHeader
+	Objects  []Object
+	Checksum [hashLength]byte
+	Index    PackfileIndex
+	filePath string
+}
+
+// NewPackfile creates a new Packfile instance
+func NewPackfile(repo *core.Repository) *Packfile {
+	return &Packfile{
+		Repo:   repo,
+		Header: PackFileHeader{Signature: [4]byte{'P', 'A', 'C', 'K'}, Version: 2},
+	}
+}
+
+// Create builds a packfile from a list of object hashes
+func (p *Packfile) Create(objectHashes []string, useDelta bool, outputPath string) error {
+	if p.Repo == nil {
+		return core.RepositoryError("nil repository", nil)
+	}
+	p.Objects = make([]Object, 0, len(objectHashes))
+	p.filePath = outputPath
+	p.Header.NumObjects = uint32(len(objectHashes))
+
+	var buf bytes.Buffer
 	h := sha256.New()
-	h.Write(packfile)
-	checksum := h.Sum(nil)
 
-	// Append the checksum to the packfile
-	finalizedPackfile := make([]byte, len(packfile)+len(checksum))
-	copy(finalizedPackfile, packfile)
-	copy(finalizedPackfile[len(packfile):], checksum)
-
-	return finalizedPackfile
-}
-
-// CalculatePackfileChecksum calculates a checksum for the packfile
-func CalculatePackfileChecksum(packfile []byte) []byte {
-	// Calculate SHA-256 checksum of the packfile
-	h := sha256.New()
-	h.Write(packfile)
-	return h.Sum(nil)
-}
-
-// FormatHash formats a binary hash as a hex string
-func FormatHash(hash []byte) string {
-	return hex.EncodeToString(hash)
-}
-
-// ParseHash parses a hex string into a binary hash
-func ParseHash(hashStr string) ([]byte, error) {
-	return hex.DecodeString(hashStr)
-}
-
-// PrintPackfileStats prints statistics about a packfile
-func PrintPackfileStats(objects []Object) {
-	fmt.Printf("Packfile contains %d objects\n", len(objects))
-
-	// Count objects by type
-	typeCounts := make(map[ObjectType]int)
-	for _, obj := range objects {
-		typeCounts[obj.Type]++
+	// Write header
+	if err := binary.Write(&buf, binary.BigEndian, &p.Header); err != nil {
+		return core.ObjectError("failed to write header", err)
 	}
+	_, _ = h.Write([]byte("PACK"))
+	_ = binary.Write(h, binary.BigEndian, p.Header.Version)
+	_ = binary.Write(h, binary.BigEndian, p.Header.NumObjects)
 
-	// Print counts by type
-	for t, count := range typeCounts {
-		fmt.Printf("  %s: %d objects\n", TypeToString(t), count)
-	}
-
-	// Calculate and print total data size
-	var totalSize int
-	for _, obj := range objects {
-		totalSize += len(obj.Data)
-	}
-	fmt.Printf("  Total data size: %d bytes\n", totalSize)
-}
-
-// CreatePackfile creates a packfile from a list of object hashes in a repository
-// and returns the binary packfile data for remote operations
-func CreatePackfile(repo *core.Repository, objectHashes []string) ([]byte, error) {
-	var objects []Object
-
-	// Load each object and add to the list
+	// Collect objects
+	offset := int64(12) // Header size
 	for _, hash := range objectHashes {
-		objType, objData, err := core.ReadObject(repo.Root, hash)
+		objType, data, err := p.Repo.ReadObject(hash)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read object %s: %w", hash, err)
+			return core.ObjectError(fmt.Sprintf("failed to read object %s", hash), err)
 		}
-
-		// Convert type string to ObjectType
-		var objTypeEnum ObjectType
-		switch objType {
-		case "commit":
-			objTypeEnum = OBJ_COMMIT
-		case "tree":
-			objTypeEnum = OBJ_TREE
-		case "blob":
-			objTypeEnum = OBJ_BLOB
-		case "tag":
-			objTypeEnum = OBJ_TAG
-		default:
-			return nil, fmt.Errorf("unknown object type %s for %s", objType, hash)
+		oType := StringToType(objType)
+		if oType == OBJ_NONE {
+			return core.ObjectError(fmt.Sprintf("unknown object type: %s", objType), nil)
 		}
-
-		objects = append(objects, Object{
-			Hash: hash,
-			Type: objTypeEnum,
-			Data: objData,
-		})
-	}
-
-	// Create the packfile from the objects
-	return CreatePackfileFromObjects(objects)
-}
-
-// CreatePackfileFromHashesRepo creates a packfile on disk from a list of object hashes
-func CreatePackfileFromHashesRepo(repo *core.Repository, objectHashes []string, outputPath string, withDeltaCompression bool) error {
-	// Load objects from the repository
-	objects := make([]Object, 0, len(objectHashes))
-	for _, hash := range objectHashes {
-		// Get object file path
-		prefix := hash[:2]
-		suffix := hash[2:]
-		objectPath := filepath.Join(repo.VecDir, "objects", prefix, suffix)
-
-		// Read the compressed object data
-		compressedData, err := os.ReadFile(objectPath)
+		hashBytes, err := hexToBytes(hash)
 		if err != nil {
-			// Skip objects that can't be read
-			fmt.Printf("Warning: Couldn't read object %s: %v\n", hash, err)
-			continue
+			return core.ObjectError(fmt.Sprintf("invalid hash format for %s", hash), err)
 		}
-
-		// Create a reader for decompression
-		zr, err := zlib.NewReader(bytes.NewReader(compressedData))
-		if err != nil {
-			fmt.Printf("Warning: Couldn't decompress object %s: %v\n", hash, err)
-			continue
-		}
-
-		// Read the decompressed content
-		var buf bytes.Buffer
-		if _, err := io.Copy(&buf, zr); err != nil {
-			zr.Close()
-			fmt.Printf("Warning: Error reading decompressed data for %s: %v\n", hash, err)
-			continue
-		}
-		zr.Close()
-
-		// Parse the header to get the object type
-		content := buf.Bytes()
-		nullIndex := bytes.IndexByte(content, 0)
-		if nullIndex == -1 {
-			fmt.Printf("Warning: Invalid object format for %s\n", hash)
-			continue
-		}
-
-		parts := bytes.SplitN(content[:nullIndex], []byte(" "), 2)
-		if len(parts) != 2 {
-			fmt.Printf("Warning: Invalid object header format for %s\n", hash)
-			continue
-		}
-
-		// Determine object type
-		var objType ObjectType // Default to zero value (OBJ_NONE)
-		switch string(parts[0]) {
-		case "commit":
-			objType = OBJ_COMMIT
-		case "tree":
-			objType = OBJ_TREE
-		case "blob":
-			objType = OBJ_BLOB
-		// case "tag": // If tags are supported by the object storage
-		// 	objType = OBJ_TAG
-		default:
-			fmt.Printf("Warning: Unknown object type '%s' for %s. Skipping object.\n", string(parts[0]), hash)
-			continue // Skip this object as its type is not recognized
-		}
-
-		// Add the object to our collection
-		var hashBytes [hashLength]byte
-		decoded, err := hex.DecodeString(hash)
-		if err == nil {
-			copy(hashBytes[:], decoded)
-		}
-
-		objects = append(objects, Object{
+		p.Objects = append(p.Objects, Object{
+			Type:      oType,
+			Size:      uint64(len(data)),
+			Data:      data,
+			Offset:    offset,
 			Hash:      hash,
 			HashBytes: hashBytes,
-			Type:      objType,
-			Data:      content[nullIndex+1:],
-			Size:      uint64(len(content[nullIndex+1:])),
 		})
 	}
 
-	// Apply delta compression if requested
-	if withDeltaCompression {
-		optimizedObjects, err := OptimizeObjects(objects)
-		if err != nil {
-			return fmt.Errorf("failed to optimize objects: %w", err)
+	// Apply delta compression
+	if useDelta {
+		if err := p.Optimize(); err != nil {
+			return core.ObjectError("failed to optimize objects", err)
 		}
-		return CreateModernPackfile(optimizedObjects, outputPath)
 	}
 
-	// Create a simple packfile without delta compression
-	return CreateModernPackfile(objects, outputPath)
+	// Write objects
+	for i := range p.Objects {
+		if err := p.writeObject(&buf, h, &p.Objects[i]); err != nil {
+			return core.ObjectError(fmt.Sprintf("failed to write object %d", i), err)
+		}
+	}
+
+	// Write and verify checksum
+	p.Checksum = sha256.Sum256(buf.Bytes())
+	if _, err := buf.Write(p.Checksum[:]); err != nil {
+		return core.ObjectError("failed to write checksum", err)
+	}
+
+	// Write to file if specified
+	if outputPath != "" {
+		if err := core.WriteFileContent(outputPath, buf.Bytes(), 0644); err != nil {
+			return core.FSError(fmt.Sprintf("failed to write packfile %s", outputPath), err)
+		}
+	}
+
+	return nil
+}
+
+// Parse reads a packfile from a file or byte slice
+func (p *Packfile) Parse(input interface{}) error {
+	var r io.Reader
+	var filePath string
+	switch v := input.(type) {
+	case string:
+		f, err := os.Open(v)
+		if err != nil {
+			return core.FSError(fmt.Sprintf("failed to open packfile %s", v), err)
+		}
+		defer f.Close()
+		filePath = v
+		r = f
+	case []byte:
+		r = bytes.NewReader(v)
+	default:
+		return core.ObjectError(fmt.Sprintf("invalid input type: %T", input), nil)
+	}
+
+	// Parse using parser.go logic
+	objects, err := parsePackfileReader(r)
+	if err != nil {
+		return core.ObjectError("failed to parse packfile", err)
+	}
+
+	p.Objects = objects
+	p.filePath = filePath
+
+	// Recompute checksum
+	var buf bytes.Buffer
+	h := sha256.New()
+	if err := binary.Write(&buf, binary.BigEndian, &p.Header); err != nil {
+		return core.ObjectError("failed to compute checksum", err)
+	}
+	_, _ = h.Write([]byte("PACK"))
+	_ = binary.Write(h, binary.BigEndian, p.Header.Version)
+	_ = binary.Write(h, binary.BigEndian, p.Header.NumObjects)
+	for i := range p.Objects {
+		if err := p.writeObject(&buf, h, &p.Objects[i]); err != nil {
+			return core.ObjectError(fmt.Sprintf("failed to compute object %d checksum", i), err)
+		}
+	}
+	p.Checksum = sha256.Sum256(buf.Bytes())
+
+	return nil
+}
+
+// Optimize applies delta compression to objects
+func (p *Packfile) Optimize() error {
+	optimized, err := OptimizeObjects(p.Objects)
+	if err != nil {
+		return err
+	}
+	p.Objects = optimized
+	return nil
+}
+
+// Finalize writes objects to the repository
+func (p *Packfile) Finalize() error {
+	if p.Repo == nil {
+		return core.RepositoryError("nil repository", nil)
+	}
+	for _, obj := range p.Objects {
+		objType := TypeToString(obj.Type)
+		if objType == "delta" || objType == "none" || objType == "unknown" {
+			continue
+		}
+		if _, err := p.Repo.WriteObject(objType, obj.Data); err != nil {
+			return core.ObjectError(fmt.Sprintf("failed to write object %s", obj.Hash), err)
+		}
+	}
+	return nil
+}
+
+// Verify checks packfile integrity
+func (p *Packfile) Verify() error {
+	var buf bytes.Buffer
+	h := sha256.New()
+
+	if err := binary.Write(&buf, binary.BigEndian, &p.Header); err != nil {
+		return core.ObjectError("failed to verify header", err)
+	}
+	_, _ = h.Write([]byte("PACK"))
+	_ = binary.Write(h, binary.BigEndian, p.Header.Version)
+	_ = binary.Write(h, binary.BigEndian, p.Header.NumObjects)
+
+	for i, obj := range p.Objects {
+		if err := p.writeObject(&buf, h, &obj); err != nil {
+			return core.ObjectError(fmt.Sprintf("failed to verify object %d", i), err)
+		}
+	}
+	computedChecksum := sha256.Sum256(buf.Bytes())
+	if !bytes.Equal(p.Checksum[:], computedChecksum[:]) {
+		return core.ObjectError("checksum verification failed", nil)
+	}
+	return nil
+}
+
+// ExtractObject retrieves an object by hash
+func (p *Packfile) ExtractObject(hash string) (*Object, error) {
+	hashBytes, err := hexToBytes(hash)
+	if err != nil {
+		return nil, core.ObjectError(fmt.Sprintf("invalid hash format: %s", hash), err)
+	}
+	for _, obj := range p.Objects {
+		if bytes.Equal(obj.HashBytes[:], hashBytes[:]) {
+			return &obj, nil
+		}
+	}
+	return nil, core.NotFoundError(core.ErrCategoryObject, fmt.Sprintf("object %s", hash[:8]))
+}
+
+// writeObject writes a single object
+func (p *Packfile) writeObject(w io.Writer, h io.Writer, obj *Object) error {
+	tee := io.MultiWriter(w, h)
+	var buf bytes.Buffer
+
+	// Encode type and size
+	typeAndSize := byte(obj.Type<<4) | 0x80
+	if _, err := buf.Write([]byte{typeAndSize}); err != nil {
+		return err
+	}
+	size := obj.Size
+	shift := uint(4)
+	for {
+		b := byte(size & 0x7F)
+		size >>= 7
+		if size == 0 {
+			if _, err := buf.Write([]byte{b}); err != nil {
+				return err
+			}
+			break
+		}
+		if _, err := buf.Write([]byte{b | 0x80}); err != nil {
+			return err
+		}
+		shift += 7
+	}
+
+	// Write delta-specific data
+	if obj.Type == OBJ_OFS_DELTA {
+		if obj.BaseIndex < 0 || obj.BaseIndex >= len(p.Objects) {
+			return fmt.Errorf("invalid base index %d for delta object", obj.BaseIndex)
+		}
+		deltaOffset := obj.Offset - p.Objects[obj.BaseIndex].Offset
+		var deltaBuf bytes.Buffer
+		for {
+			b := byte(deltaOffset & 0x7F)
+			deltaOffset >>= 7
+			if deltaOffset == 0 {
+				deltaBuf.WriteByte(b)
+				break
+			}
+			deltaBuf.WriteByte(b | 0x80)
+		}
+		if _, err := buf.Write(deltaBuf.Bytes()); err != nil {
+			return err
+		}
+	} else if obj.Type == OBJ_REF_DELTA {
+		if _, err := buf.Write(obj.BaseHashBytes[:]); err != nil {
+			return err
+		}
+	}
+
+	// Compress data
+	zw, err := zlib.NewWriterLevel(&buf, zlib.BestCompression)
+	if err != nil {
+		return core.ObjectError("failed to create zlib writer", err)
+	}
+	if _, err := zw.Write(obj.Data); err != nil {
+		zw.Close()
+		return core.ObjectError("failed to write object data", err)
+	}
+	if err := zw.Close(); err != nil {
+		return core.ObjectError("failed to close zlib writer", err)
+	}
+
+	_, err = buf.WriteTo(tee)
+	return err
+}
+
+// hexToBytes converts a hex string to a byte array
+func hexToBytes(hexStr string) ([hashLength]byte, error) {
+	var result [hashLength]byte
+	if len(hexStr) != hexHashLength {
+		return result, fmt.Errorf("invalid hash length: %d", len(hexStr))
+	}
+	bytes, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return result, err
+	}
+	copy(result[:], bytes)
+	return result, nil
 }

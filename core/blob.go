@@ -1,49 +1,58 @@
 package core
 
-import (
-	"fmt"
-)
-
-// CreateBlobRepo creates a new blob object using Repository context.
+// CreateBlob creates a new blob object from content using the Repository context.
+// Returns the SHA-256 hash of the blob.
 func (repo *Repository) CreateBlob(content []byte) (string, error) {
-	// Use WriteObject to handle hashing, header formatting, and writing.
+	if content == nil {
+		return "", ObjectError("nil content provided for blob", nil)
+	}
 	hash, err := repo.WriteObject("blob", content)
 	if err != nil {
-		return "", ObjectError(fmt.Sprintf("failed to create blob object: %s", err.Error()), err)
+		return "", ObjectError("failed to create blob", err)
 	}
 	return hash, nil
 }
 
-// CreateBlob creates a new blob object using repository path.
+// CreateBlob creates a new blob object from content using repository path.
 // This is a convenience function for code that doesn't have a Repository context.
 func CreateBlob(repoRoot string, content []byte) (string, error) {
-	// Create a temporary Repository object
+	if repoRoot == "" {
+		return "", RepositoryError("empty repository path provided", nil)
+	}
+	if content == nil {
+		return "", ObjectError("nil content provided for blob", nil)
+	}
 	repo := NewRepository(repoRoot)
 	return repo.CreateBlob(content)
 }
 
-// GetBlobRepo retrieves a blob object by its hash using Repository context.
+// GetBlob retrieves a blob object by its hash using the Repository context.
 func (repo *Repository) GetBlob(hash string) ([]byte, error) {
+	if len(hash) != 64 || !IsValidHex(hash) {
+		return nil, ObjectError("invalid blob hash format", nil)
+	}
 	objectType, data, err := repo.ReadObject(hash)
 	if err != nil {
-		// ReadObject already returns a categorized error (e.g., if not found or format is bad)
 		if IsErrNotFound(err) {
-			return nil, NotFoundError(ErrCategoryObject, fmt.Sprintf("blob %s", hash))
+			return nil, NotFoundError(ErrCategoryObject, "blob "+hash[:8])
 		}
-		return nil, ObjectError(fmt.Sprintf("failed to read blob %s: %s", hash, err.Error()), err)
+		return nil, ObjectError("failed to read blob", err)
 	}
-
 	if objectType != "blob" {
-		return nil, ObjectError(fmt.Sprintf("object %s is not a blob, but a %s", hash, objectType), nil)
+		return nil, ObjectError("object is not a blob, but a "+objectType, nil)
 	}
-
 	return data, nil
 }
 
 // GetBlob retrieves a blob object by its hash using repository path.
 // This is a convenience function for code that doesn't have a Repository context.
 func GetBlob(repoRoot string, hash string) ([]byte, error) {
-	// Create a temporary Repository object
+	if repoRoot == "" {
+		return nil, RepositoryError("empty repository path provided", nil)
+	}
+	if len(hash) != 64 || !IsValidHex(hash) {
+		return nil, ObjectError("invalid blob hash format", nil)
+	}
 	repo := NewRepository(repoRoot)
 	return repo.GetBlob(hash)
 }

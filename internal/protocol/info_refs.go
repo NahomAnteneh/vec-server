@@ -1,12 +1,15 @@
 package protocol
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"net/http"
+	"path/filepath" // Import for joining paths for refs
 	"strings"
 
-	"github.com/NahomAnteneh/vec-server/internal/db/models"
+	// For core.ReadHEADFile
+
 	"github.com/NahomAnteneh/vec-server/internal/repository"
 )
 
@@ -43,15 +46,6 @@ func InfoRefsHandler(repoManager *repository.Manager, logger *log.Logger) http.H
 			return
 		}
 
-		repo := &models.Repository{Path: repoPath}
-		refs, err := repoManager.GetRefs(repo)
-		if err != nil {
-			logger.Printf("INFO_REFS: Error reading refs for %s: %v", repoPath, err)
-			http.Error(w, "Error reading refs", http.StatusInternalServerError)
-			return
-		}
-		logger.Printf("INFO_REFS: Found %d refs", len(refs))
-
 		w.Header().Set("Content-Type", fmt.Sprintf("application/x-%s-advertisement", service))
 		w.Header().Set("Cache-Control", "no-cache")
 
@@ -63,27 +57,73 @@ func InfoRefsHandler(repoManager *repository.Manager, logger *log.Logger) http.H
 
 		capabilities := getCapabilities(service)
 		logger.Printf("INFO_REFS: Capabilities: %s", capabilities)
+		firstRefWritten := false
 
-		firstRef := true
-		for refName, hash := range refs {
-			if hash == strings.Repeat("0", 64) {
-				logger.Printf("INFO_REFS: Skipping all-zeros hash for ref %s", refName)
+		// 1. Get and write HEAD information
+		headCommitHash, err := repoManager.GetHeadCommitHash(repoPath)
+		if err != nil {
+			logger.Printf("INFO_REFS: Error reading HEAD for %s: %v", repoPath, err)
+		} else if headCommitHash != "" && headCommitHash != strings.Repeat("0", 64) {
+			var headBuf bytes.Buffer
+			headBuf.WriteString(fmt.Sprintf("%s HEAD", headCommitHash))
+			headBuf.WriteByte(0x00) // NUL byte
+			headBuf.WriteString(capabilities)
+
+			logger.Printf("INFO_REFS: Writing HEAD ref: %s (commit: %s)", "HEAD", headCommitHash)
+			if err := WritePacketLine(w, headBuf.Bytes()); err != nil {
+				logger.Printf("INFO_REFS: Error writing HEAD ref line: %v", err)
+				http.Error(w, "Error writing response", http.StatusInternalServerError)
+				return
+			}
+			firstRefWritten = true
+		}
+
+		// 2. Get and write all branch refs (refs/heads/*)
+		branchMap, err := repoManager.GetBranches(repoPath)
+		if err != nil {
+			logger.Printf("INFO_REFS: Error reading branches for %s: %v", repoPath, err)
+			// If no branches, it could be an empty repo. If HEAD wasn't written, might not be an error to have no refs.
+			if !firstRefWritten && strings.Contains(err.Error(), "not found") { // If it's a typical not found error and no HEAD, maybe it's an empty repo
+				// Don't send error yet, just means no refs to list after HEAD
+			} else {
+				http.Error(w, "Error reading refs", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		for branchName, commitHash := range branchMap {
+			if commitHash == "" || commitHash == strings.Repeat("0", 64) { // Skip empty or null hashes
+				logger.Printf("INFO_REFS: Skipping empty or zero hash for ref refs/heads/%s", branchName)
 				continue
 			}
-			var refLine string
-			if firstRef {
-				refLine = fmt.Sprintf("%s %s\x00%s", hash, refName, capabilities)
-				firstRef = false
+			refFullName := filepath.Join("refs", "heads", branchName) // Git typically uses / for network paths
+			refFullName = strings.ReplaceAll(refFullName, "\\", "/")  // Ensure forward slashes
+
+			var refLineBytes []byte
+			if !firstRefWritten { // If HEAD wasn't written (e.g. empty repo, no HEAD commit yet)
+				var branchBuf bytes.Buffer
+				branchBuf.WriteString(fmt.Sprintf("%s %s", commitHash, refFullName))
+				branchBuf.WriteByte(0x00) // NUL byte
+				branchBuf.WriteString(capabilities)
+				refLineBytes = branchBuf.Bytes()
+				firstRefWritten = true
 			} else {
-				refLine = fmt.Sprintf("%s %s", hash, refName)
+				refLineBytes = []byte(fmt.Sprintf("%s %s", commitHash, refFullName))
 			}
-			logger.Printf("INFO_REFS: Writing ref: %s -> %s", refName, hash)
-			if err := WritePacketLine(w, []byte(refLine)); err != nil {
+			logger.Printf("INFO_REFS: Writing branch ref: %s -> %s", refFullName, commitHash)
+			if err := WritePacketLine(w, refLineBytes); err != nil {
 				logger.Printf("INFO_REFS: Error writing ref line: %v", err)
 				http.Error(w, "Error writing response", http.StatusInternalServerError)
 				return
 			}
 		}
+
+		// If after all this, no refs were written (e.g., truly empty repo with no HEAD and no branches),
+		// some clients might expect at least the # service line and a flush packet.
+		// Git typically sends `0000` (flush) even if there are no refs other than the capabilities line with HEAD.
+		// If `firstRefWritten` is false, it means no refs (including HEAD) had a valid commit hash.
+		// In such a case (truly empty repo), Git server sends `hash_of_empty_commit refs/heads/master capabilities` (if master is default)
+		// or just `0000` if no refs at all. Our current logic will send 0000 if no refs are written.
 
 		if err := WriteFlushPacket(w); err != nil {
 			logger.Printf("INFO_REFS: Error writing flush packet: %v", err)

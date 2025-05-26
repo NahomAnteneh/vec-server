@@ -12,8 +12,11 @@ const (
 )
 
 // ReadHEADFile reads the content of the HEAD file and returns it trimmed.
-func ReadHEADFile(repoRoot string) (string, error) {
-	headPath := filepath.Join(repoRoot, VecDirName, HeadFile)
+func ReadHEADFile(repo *Repository) (string, error) {
+	if repo == nil {
+		return "", RepositoryError("nil repository", nil)
+	}
+	headPath := repo.HeadPath
 	headContent, err := ReadFileContent(headPath)
 	if err != nil {
 		return "", RefError("failed to read HEAD", err)
@@ -22,21 +25,20 @@ func ReadHEADFile(repoRoot string) (string, error) {
 }
 
 // ReadHEAD retrieves the commit ID that HEAD points to.
-func ReadHEAD(repoRoot string) (string, error) {
-	headContent, err := ReadHEADFile(repoRoot)
+func ReadHEAD(repo *Repository) (string, error) {
+	if repo == nil {
+		return "", RepositoryError("nil repository", nil)
+	}
+	headContent, err := ReadHEADFile(repo)
 	if err != nil {
-		return "", err // Already a RefError or similar
+		return "", err
 	}
 
-	// Check if HEAD is a ref
 	if strings.HasPrefix(headContent, "ref: ") {
 		refPath := strings.TrimPrefix(headContent, "ref: ")
-		refFile := filepath.Join(repoRoot, VecDirName, refPath)
+		refFile := filepath.Join(repo.VecDir, refPath)
 
-		// Check if reference file exists
 		if !FileExists(refFile) {
-			// If the ref file (e.g., refs/heads/main) doesn't exist, it's an error.
-			// This could mean a broken ref or an uninitialized branch.
 			return "", NotFoundError(ErrCategoryRef, fmt.Sprintf("reference file '%s' pointed to by HEAD", refPath))
 		}
 
@@ -47,51 +49,82 @@ func ReadHEAD(repoRoot string) (string, error) {
 		return strings.TrimSpace(string(commitID)), nil
 	}
 
-	// Handle detached HEAD (direct commit hash)
 	if len(headContent) == 64 && IsValidHex(headContent) {
 		return headContent, nil
 	}
 
-	// If not a valid ref and not a valid hash, it's an invalid HEAD content.
 	return "", RefError(fmt.Sprintf("invalid HEAD content: '%s'", headContent), nil)
 }
 
 // GetHeadCommit gets the SHA-256 of the current HEAD commit.
-// This is an alias for ReadHEAD for backward compatibility.
-func GetHeadCommit(repoRoot string) (string, error) {
-	return ReadHEAD(repoRoot)
+func GetHeadCommit(repo *Repository) (string, error) {
+	return ReadHEAD(repo)
 }
 
 // GetCurrentBranch returns the name of the current branch.
-func GetCurrentBranch(repoRoot string) (string, error) {
-	headContent, err := ReadHEADFile(repoRoot)
+func GetCurrentBranch(repo *Repository) (string, error) {
+	if repo == nil {
+		return "", RepositoryError("nil repository", nil)
+	}
+	headContent, err := ReadHEADFile(repo)
 	if err != nil {
 		return "", err
 	}
 
-	// Check if HEAD is a ref
 	if strings.HasPrefix(headContent, "ref: ") {
 		refPath := strings.TrimPrefix(headContent, "ref: ")
 		parts := strings.Split(refPath, "/")
-		branchName := parts[len(parts)-1] // Get the last part
+		branchName := parts[len(parts)-1]
 		return branchName, nil
 	}
 
-	// Detached HEAD
 	return "(HEAD detached)", nil
 }
 
-// WriteRef writes a reference file.
-func WriteRef(repoRoot, refPath, commitHash string) error {
-	fullPath := filepath.Join(repoRoot, VecDirName, refPath)
+// ReadRef reads the commit ID from a reference file (e.g., refs/heads/main).
+func ReadRef(repo *Repository, refPath string) (string, error) {
+	if repo == nil {
+		return "", RepositoryError("nil repository", nil)
+	}
 
-	// Ensure the directory exists
+	// Construct the full path to the ref file
+	absPath := filepath.Join(repo.VecDir, refPath)
+
+	// Read the ref file
+	content, err := os.ReadFile(absPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", RefError(fmt.Sprintf("reference %s does not exist", refPath), err)
+		}
+		return "", RefError(fmt.Sprintf("failed to read reference %s", refPath), err)
+	}
+
+	// Trim whitespace and validate
+	commitID := strings.TrimSpace(string(content))
+	if commitID == "" {
+		return "", RefError(fmt.Sprintf("reference %s is empty", refPath), nil)
+	}
+
+	// Basic validation of commit ID (SHA-256 hash)
+	if len(commitID) != 64 || !IsValidHex(commitID) {
+		return "", RefError(fmt.Sprintf("invalid commit ID in reference %s", refPath), nil)
+	}
+
+	return commitID, nil
+}
+
+// WriteRef writes a reference file.
+func WriteRef(repo *Repository, refPath, commitHash string) error {
+	if repo == nil {
+		return RepositoryError("nil repository", nil)
+	}
+	fullPath := filepath.Join(repo.VecDir, refPath)
+
 	if err := EnsureDirExists(filepath.Dir(fullPath)); err != nil {
 		return RefError("failed to create reference directory", err)
 	}
 
-	// Write the reference file
-	if err := os.WriteFile(fullPath, []byte(commitHash), 0644); err != nil {
+	if err := WriteFileContent(fullPath, []byte(commitHash), 0644); err != nil {
 		return RefError("failed to write reference file", err)
 	}
 
@@ -99,17 +132,18 @@ func WriteRef(repoRoot, refPath, commitHash string) error {
 }
 
 // UpdateHEAD updates the HEAD file to point to a reference or commit hash.
-func UpdateHEAD(repoRoot, target string, isRef bool) error {
-	headPath := filepath.Join(repoRoot, VecDirName, HeadFile)
+func UpdateHEAD(repo *Repository, target string, isRef bool) error {
+	if repo == nil {
+		return RepositoryError("nil repository", nil)
+	}
 	var content string
-
 	if isRef {
 		content = fmt.Sprintf("ref: %s", target)
 	} else {
 		content = target
 	}
 
-	if err := os.WriteFile(headPath, []byte(content), 0644); err != nil {
+	if err := WriteFileContent(repo.HeadPath, []byte(content), 0644); err != nil {
 		return RefError("failed to update HEAD", err)
 	}
 
@@ -117,20 +151,21 @@ func UpdateHEAD(repoRoot, target string, isRef bool) error {
 }
 
 // GetAllBranches returns a list of all branches in the repository
-func GetAllBranches(repoRoot string) ([]string, error) {
-	branchesDir := filepath.Join(repoRoot, VecDirName, "refs", "heads")
+func GetAllBranches(repo *Repository) ([]string, error) {
+	if repo == nil {
+		return nil, RepositoryError("nil repository", nil)
+	}
+	branchesDir := repo.RefsDir + "/heads"
 	if !FileExists(branchesDir) {
 		return nil, NotFoundError(ErrCategoryRef, "branches directory")
 	}
 
 	var branches []string
-	err := filepath.Walk(branchesDir, func(path string, info os.FileInfo, err error) error {
+	err := WalkDir(branchesDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		// Skip directories, we only want the branch files
 		if !info.IsDir() {
-			// Get the branch name from the path
 			relativePath, err := filepath.Rel(branchesDir, path)
 			if err != nil {
 				return err
@@ -148,28 +183,26 @@ func GetAllBranches(repoRoot string) ([]string, error) {
 }
 
 // SetBranchUpstream sets the upstream branch for a local branch
-func SetBranchUpstream(repoRoot, branchName, remoteName string) error {
-	// Ensure the branch exists
-	branchPath := filepath.Join(repoRoot, VecDirName, "refs", "heads", branchName)
+func SetBranchUpstream(repo *Repository, branchName, remoteName string) error {
+	if repo == nil {
+		return RepositoryError("nil repository", nil)
+	}
+	branchPath := filepath.Join(repo.RefsDir, "heads", branchName)
 	if !FileExists(branchPath) {
 		return NotFoundError(ErrCategoryRef, fmt.Sprintf("branch '%s'", branchName))
 	}
 
-	// Set upstream configuration in the config file
 	branchKey := fmt.Sprintf("branch.%s.remote", branchName)
 	mergeKey := fmt.Sprintf("branch.%s.merge", branchName)
 
-	// Read the config
-	configPath := filepath.Join(repoRoot, VecDirName, "config")
+	configPath := repo.ConfigFile
 	config, err := ReadConfig(configPath)
 	if err != nil {
 		return ConfigError("failed to read config", err)
 	}
 
-	// Update the config
 	config[branchKey] = remoteName
 	config[mergeKey] = fmt.Sprintf("refs/heads/%s", branchName)
 
-	// Write the updated config
 	return WriteConfig(configPath, config)
 }
