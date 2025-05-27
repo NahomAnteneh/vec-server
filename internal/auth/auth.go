@@ -1,16 +1,30 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"time"
 
 	"github.com/NahomAnteneh/vec-server/internal/db/models"
-	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
+
+// contextKey is a custom type to avoid collisions in the context value map
+type contextKey string
+
+// AuthenticatedUserKey is the key used to store the authenticated user in the context
+const AuthenticatedUserKey contextKey = "authenticated_user"
+
+// GetUserFromContext retrieves the authenticated user from the context
+func GetUserFromContext(ctx context.Context) *models.User {
+	if user, ok := ctx.Value(AuthenticatedUserKey).(*models.User); ok {
+		return user
+	}
+	return nil
+}
 
 const (
 	// TokenExpiration defines how long a token remains valid
@@ -25,12 +39,6 @@ var (
 	// ErrInvalidToken is returned when a token is invalid
 	ErrInvalidToken = errors.New("invalid token")
 )
-
-// Claims defines the JWT claims structure
-type Claims struct {
-	UserID uint `json:"user_id"`
-	jwt.RegisteredClaims
-}
 
 // HashPassword creates a bcrypt hash of the password
 func HashPassword(password string) (string, error) {
@@ -114,17 +122,12 @@ func CreateAuthToken(db *gorm.DB, userID uint, description string) (*AuthToken, 
 func VerifyAuthToken(db *gorm.DB, tokenStr string) (*models.User, error) {
 	var tokens []AuthToken
 
-	// Get all tokens - we'll need to check each hash
-	if err := db.Preload("User").Find(&tokens).Error; err != nil {
+	// Query non-expired tokens
+	if err := db.Preload("User").Where("expires_at IS NULL OR expires_at > ?", time.Now()).Find(&tokens).Error; err != nil {
 		return nil, err
 	}
 
 	for _, token := range tokens {
-		// Skip expired tokens
-		if token.ExpiresAt != nil && token.ExpiresAt.Before(time.Now()) {
-			continue
-		}
-
 		// Check if token matches
 		if CheckPasswordHash(tokenStr, token.TokenHash) {
 			return &token.User, nil

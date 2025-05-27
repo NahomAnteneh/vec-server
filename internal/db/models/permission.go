@@ -31,19 +31,18 @@ func (Permission) TableName() string {
 	return "permissions"
 }
 
-// PermissionService provides methods for interacting with permissions in the database
-type PermissionService struct {
+// PermissionServiceImpl provides methods for interacting with permissions in the database
+type PermissionServiceImpl struct {
 	db *gorm.DB
 }
 
-// NewPermissionService creates a new permission service with the given database connection
-func NewPermissionService(db *gorm.DB) *PermissionService {
-	return &PermissionService{db: db}
+// NewPermissionService creates a new permission service
+func NewPermissionService(db *gorm.DB) PermissionService {
+	return &PermissionServiceImpl{db: db}
 }
 
 // Create inserts a new permission into the database
-func (s *PermissionService) Create(perm *Permission) error {
-	// Validate access level
+func (s *PermissionServiceImpl) Create(perm *Permission) error {
 	if !isValidAccessLevel(perm.AccessLevel) {
 		return errors.New("invalid access level")
 	}
@@ -51,7 +50,7 @@ func (s *PermissionService) Create(perm *Permission) error {
 }
 
 // GetByUserAndRepo retrieves a permission by user ID and repository ID
-func (s *PermissionService) GetByUserAndRepo(userID, repoID uint) (*Permission, error) {
+func (s *PermissionServiceImpl) GetByUserAndRepo(userID, repoID uint) (*Permission, error) {
 	var perm Permission
 	err := s.db.Where("user_id = ? AND repository_id = ?", userID, repoID).
 		Preload("User").
@@ -67,26 +66,20 @@ func (s *PermissionService) GetByUserAndRepo(userID, repoID uint) (*Permission, 
 }
 
 // Update updates an existing permission in the database
-func (s *PermissionService) Update(perm *Permission) error {
-	// Validate access level
+func (s *PermissionServiceImpl) Update(perm *Permission) error {
 	if !isValidAccessLevel(perm.AccessLevel) {
 		return errors.New("invalid access level")
 	}
 	return s.db.Save(perm).Error
 }
 
-// Delete removes a permission from the database
-func (s *PermissionService) Delete(id uint) error {
-	return s.db.Delete(&Permission{}, id).Error
-}
-
 // DeleteByUserAndRepo removes a permission by user ID and repository ID
-func (s *PermissionService) DeleteByUserAndRepo(userID, repoID uint) error {
+func (s *PermissionServiceImpl) DeleteByUserAndRepo(userID, repoID uint) error {
 	return s.db.Where("user_id = ? AND repository_id = ?", userID, repoID).Delete(&Permission{}).Error
 }
 
-// ListByRepository retrieves all permissions for a repository with pagination
-func (s *PermissionService) ListByRepository(repoID uint) ([]*Permission, error) {
+// ListByRepository retrieves all permissions for a repository
+func (s *PermissionServiceImpl) ListByRepository(repoID uint) ([]*Permission, error) {
 	var perms []*Permission
 	err := s.db.Where("repository_id = ?", repoID).
 		Preload("User").
@@ -94,19 +87,8 @@ func (s *PermissionService) ListByRepository(repoID uint) ([]*Permission, error)
 	return perms, err
 }
 
-// ListByUser retrieves all permissions for a user
-func (s *PermissionService) ListByUser(userID uint) ([]*Permission, error) {
-	var perms []*Permission
-	err := s.db.Where("user_id = ?", userID).
-		Preload("Repository").
-		Preload("Repository.Owner").
-		Find(&perms).Error
-	return perms, err
-}
-
 // HasPermission checks if a user has at least the specified permission level on a repository
-func (s *PermissionService) HasPermission(userID, repoID uint, requiredLevel string) (bool, error) {
-	// Get the repository to check if the user is the owner (owners have implicit admin access)
+func (s *PermissionServiceImpl) HasPermission(userID, repoID uint, requiredLevel string) (bool, error) {
 	var repo Repository
 	err := s.db.First(&repo, repoID).Error
 	if err != nil {
@@ -136,25 +118,18 @@ func (s *PermissionService) HasPermission(userID, repoID uint, requiredLevel str
 	return hasAtLeastPermissionLevel(perm.AccessLevel, requiredLevel), nil
 }
 
-// Helper functions
-
 // isValidAccessLevel checks if an access level is valid
 func isValidAccessLevel(level string) bool {
 	return level == ReadPermission || level == WritePermission || level == AdminPermission
 }
 
-// hasAtLeastPermissionLevel checks if the given permission level is at least the required level
+// hasAtLeastPermissionLevel checks if the given permission level meets or exceeds the required level
 func hasAtLeastPermissionLevel(currentLevel, requiredLevel string) bool {
-	// Admin has all permissions
 	if currentLevel == AdminPermission {
 		return true
 	}
-
-	// Write includes read permission
-	if currentLevel == WritePermission && requiredLevel == ReadPermission {
+	if currentLevel == WritePermission && (requiredLevel == WritePermission || requiredLevel == ReadPermission) {
 		return true
 	}
-
-	// Exact match
 	return currentLevel == requiredLevel
 }

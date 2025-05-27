@@ -3,13 +3,14 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"regexp"
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
 
-	"github.com/vec-server/internal/auth"
-	"github.com/vec-server/internal/db/models"
+	"github.com/NahomAnteneh/vec-server/internal/auth"
+	"github.com/NahomAnteneh/vec-server/internal/db/models"
 )
 
 // UserResponse represents the response format for user operations
@@ -17,6 +18,7 @@ type UserResponse struct {
 	ID        uint   `json:"id"`
 	Username  string `json:"username"`
 	Email     string `json:"email"`
+	IsAdmin   bool   `json:"is_admin"`
 	CreatedAt string `json:"created_at"`
 }
 
@@ -34,83 +36,75 @@ type UpdateUserRequest struct {
 }
 
 // RegisterUser handles user registration
-func RegisterUser(userService *models.UserService) http.HandlerFunc {
+func RegisterUser(userService models.UserService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Parse request body
 		var req RegisterRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request payload", http.StatusBadRequest)
 			return
 		}
 
-		// Validate required fields
 		if req.Username == "" || req.Email == "" || req.Password == "" {
 			http.Error(w, "Username, email, and password are required", http.StatusBadRequest)
 			return
 		}
 
-		// Validate email format
 		if !isValidEmail(req.Email) {
 			http.Error(w, "Invalid email format", http.StatusBadRequest)
 			return
 		}
 
-		// Validate password complexity
 		if !isValidPassword(req.Password) {
-			http.Error(w, "Password doesn't meet complexity requirements", http.StatusBadRequest)
+			http.Error(w, "Password must be at least 8 characters, with uppercase, lowercase, and numbers", http.StatusBadRequest)
 			return
 		}
 
-		// Create new user
 		user, err := models.NewUser(req.Username, req.Email, req.Password)
 		if err != nil {
 			http.Error(w, "Failed to create user: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// Save user to database
 		if err := userService.Create(user); err != nil {
 			http.Error(w, "Failed to register user: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// Return success response
 		render.Status(r, http.StatusCreated)
 		render.JSON(w, r, UserResponse{
 			ID:        user.ID,
 			Username:  user.Username,
 			Email:     user.Email,
+			IsAdmin:   user.IsAdmin,
 			CreatedAt: user.CreatedAt.Format(http.TimeFormat),
 		})
 	}
 }
 
 // GetUserProfile retrieves user profile information
-func GetUserProfile(userService *models.UserService) http.HandlerFunc {
+func GetUserProfile(userService models.UserService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		username := chi.URLParam(r, "username")
 
-		// Get user by username
 		user, err := userService.GetByUsername(username)
 		if err != nil {
 			http.Error(w, "User not found", http.StatusNotFound)
 			return
 		}
 
-		// Return user profile data
 		render.JSON(w, r, UserResponse{
 			ID:        user.ID,
 			Username:  user.Username,
 			Email:     user.Email,
+			IsAdmin:   user.IsAdmin,
 			CreatedAt: user.CreatedAt.Format(http.TimeFormat),
 		})
 	}
 }
 
 // UpdateUserProfile updates user settings
-func UpdateUserProfile(userService *models.UserService) http.HandlerFunc {
+func UpdateUserProfile(userService models.UserService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Get authenticated user
 		authUser := auth.GetUserFromContext(r.Context())
 		if authUser == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -119,27 +113,23 @@ func UpdateUserProfile(userService *models.UserService) http.HandlerFunc {
 
 		username := chi.URLParam(r, "username")
 
-		// Check if authenticated user is updating their own profile
 		if authUser.Username != username {
 			http.Error(w, "You can only update your own profile", http.StatusForbidden)
 			return
 		}
 
-		// Get user by username
 		user, err := userService.GetByUsername(username)
 		if err != nil {
 			http.Error(w, "User not found", http.StatusNotFound)
 			return
 		}
 
-		// Parse request body
 		var req UpdateUserRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request payload", http.StatusBadRequest)
 			return
 		}
 
-		// Update user fields if provided
 		if req.Email != "" && req.Email != user.Email {
 			if !isValidEmail(req.Email) {
 				http.Error(w, "Invalid email format", http.StatusBadRequest)
@@ -150,7 +140,7 @@ func UpdateUserProfile(userService *models.UserService) http.HandlerFunc {
 
 		if req.Password != "" {
 			if !isValidPassword(req.Password) {
-				http.Error(w, "Password doesn't meet complexity requirements", http.StatusBadRequest)
+				http.Error(w, "Password must be at least 8 characters, with uppercase, lowercase, and numbers", http.StatusBadRequest)
 				return
 			}
 			if err := user.UpdatePassword(req.Password); err != nil {
@@ -159,26 +149,24 @@ func UpdateUserProfile(userService *models.UserService) http.HandlerFunc {
 			}
 		}
 
-		// Save updated user to database
 		if err := userService.Update(user); err != nil {
 			http.Error(w, "Failed to update user: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// Return updated user data
 		render.JSON(w, r, UserResponse{
 			ID:        user.ID,
 			Username:  user.Username,
 			Email:     user.Email,
+			IsAdmin:   user.IsAdmin,
 			CreatedAt: user.CreatedAt.Format(http.TimeFormat),
 		})
 	}
 }
 
 // DeleteUser handles account deletion
-func DeleteUser(userService *models.UserService) http.HandlerFunc {
+func DeleteUser(userService models.UserService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Get authenticated user
 		authUser := auth.GetUserFromContext(r.Context())
 		if authUser == nil {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -187,47 +175,31 @@ func DeleteUser(userService *models.UserService) http.HandlerFunc {
 
 		username := chi.URLParam(r, "username")
 
-		// Check if authenticated user is deleting their own account
-		if authUser.Username != username {
-			// Check if authenticated user is an admin
-			isAdmin := r.Context().Value("isAdmin").(bool)
-			if !isAdmin {
-				http.Error(w, "You can only delete your own account", http.StatusForbidden)
-				return
-			}
+		if authUser.Username != username && !authUser.IsAdmin {
+			http.Error(w, "You can only delete your own account unless you are an admin", http.StatusForbidden)
+			return
 		}
 
-		// Get user by username
 		user, err := userService.GetByUsername(username)
 		if err != nil {
 			http.Error(w, "User not found", http.StatusNotFound)
 			return
 		}
 
-		// Delete user from database
 		if err := userService.Delete(user.ID); err != nil {
 			http.Error(w, "Failed to delete user: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// Return success with no content
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
 // ListUsers returns a paginated list of users (admin only)
-func ListUsers(userService *models.UserService) http.HandlerFunc {
+func ListUsers(userService models.UserService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Check if authenticated user is an admin
-		isAdmin := r.Context().Value("isAdmin").(bool)
-		if !isAdmin {
-			http.Error(w, "Admin access required", http.StatusForbidden)
-			return
-		}
-
-		// Parse pagination parameters
-		limit := 20 // Default limit
-		offset := 0 // Default offset
+		limit := 20
+		offset := 0
 
 		limitParam := r.URL.Query().Get("limit")
 		if limitParam != "" {
@@ -245,25 +217,23 @@ func ListUsers(userService *models.UserService) http.HandlerFunc {
 			}
 		}
 
-		// Get users with pagination
 		users, err := userService.List(limit, offset)
 		if err != nil {
 			http.Error(w, "Failed to list users: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// Format response
 		var userResponses []UserResponse
 		for _, user := range users {
 			userResponses = append(userResponses, UserResponse{
 				ID:        user.ID,
 				Username:  user.Username,
 				Email:     user.Email,
+				IsAdmin:   user.IsAdmin,
 				CreatedAt: user.CreatedAt.Format(http.TimeFormat),
 			})
 		}
 
-		// Return paginated result
 		render.JSON(w, r, map[string]interface{}{
 			"users":       userResponses,
 			"next_cursor": offset + len(userResponses),
@@ -271,28 +241,16 @@ func ListUsers(userService *models.UserService) http.HandlerFunc {
 	}
 }
 
-// Helper functions
-
 // isValidEmail validates email format
 func isValidEmail(email string) bool {
-	// Basic validation to ensure email contains @ symbol
-	// In a real implementation, use a proper validation library or regex
-	return len(email) > 3 && contains(email, "@")
+	regex := regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
+	return regex.MatchString(email)
 }
 
 // isValidPassword checks password complexity
 func isValidPassword(password string) bool {
-	// Basic validation for password - require at least 8 characters
-	// In a real implementation, check for complexity (uppercase, lowercase, numbers, special chars)
-	return len(password) >= 8
-}
-
-// contains checks if a string contains a substring
-func contains(s, substr string) bool {
-	for i := 0; i < len(s); i++ {
-		if i+len(substr) <= len(s) && s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
+	hasUpper := regexp.MustCompile(`[A-Z]`).MatchString(password)
+	hasLower := regexp.MustCompile(`[a-z]`).MatchString(password)
+	hasNumber := regexp.MustCompile(`[0-9]`).MatchString(password)
+	return len(password) >= 8 && hasUpper && hasLower && hasNumber
 }

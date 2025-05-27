@@ -1,20 +1,27 @@
 version: '3'
 
 services:
-  vec-server:
+  vec-repository-server:
     build: .
     ports:
-      - "8000:8000"
+      - "8080:8080"
     environment:
-      - VEC_SERVER_PORT=8000
+      - VEC_SERVER_PORT=8080
       - VEC_DATABASE_URL=postgres://postgres:postgres@postgres:5432/vecserver?sslmode=disable
-      - VEC_REPO_PATH=/data/repos
-      - VEC_JWT_SECRET=vec-server-secret-key
+      - VEC_REPO_PATH=/data/repositories
+      - VEC_JWT_SECRET=vec-repository-secret-key
+      - VEC_CONFIG_PATH=/root/config/repository-server.yml
     volumes:
-      - ./data:/data
+      - repository-data:/data/repositories
     depends_on:
       - postgres
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
   postgres:
     image: postgres:14-alpine
@@ -27,6 +34,12 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
-  postgres-data: 
+  postgres-data:
+  repository-data: 

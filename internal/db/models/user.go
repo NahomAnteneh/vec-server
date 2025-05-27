@@ -14,6 +14,7 @@ type User struct {
 	Username     string    `json:"username" gorm:"uniqueIndex;size:255;not null"`
 	Email        string    `json:"email" gorm:"uniqueIndex;size:255;not null"`
 	PasswordHash string    `json:"-" gorm:"size:255;not null"`
+	IsAdmin      bool      `json:"is_admin" gorm:"default:false"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
@@ -23,16 +24,13 @@ func NewUser(username, email, password string) (*User, error) {
 	if username == "" {
 		return nil, errors.New("username cannot be empty")
 	}
-
 	if email == "" {
 		return nil, errors.New("email cannot be empty")
 	}
-
 	if password == "" {
 		return nil, errors.New("password cannot be empty")
 	}
 
-	// Hash the password
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return nil, err
@@ -66,23 +64,23 @@ func (u *User) UpdatePassword(password string) error {
 	return nil
 }
 
-// UserService provides methods for interacting with users in the database
-type UserService struct {
+// UserServiceImpl provides methods for interacting with users in the database
+type UserServiceImpl struct {
 	db *gorm.DB
 }
 
-// NewUserService creates a new user service with the given database connection
-func NewUserService(db *gorm.DB) *UserService {
-	return &UserService{db: db}
+// NewUserService creates a new user service
+func NewUserService(db *gorm.DB) UserService {
+	return &UserServiceImpl{db: db}
 }
 
 // Create inserts a new user into the database
-func (s *UserService) Create(user *User) error {
+func (s *UserServiceImpl) Create(user *User) error {
 	return s.db.Create(user).Error
 }
 
 // GetByID retrieves a user by their ID
-func (s *UserService) GetByID(id uint) (*User, error) {
+func (s *UserServiceImpl) GetByID(id uint) (*User, error) {
 	var user User
 	err := s.db.First(&user, id).Error
 	if err != nil {
@@ -95,7 +93,7 @@ func (s *UserService) GetByID(id uint) (*User, error) {
 }
 
 // GetByUsername retrieves a user by their username
-func (s *UserService) GetByUsername(username string) (*User, error) {
+func (s *UserServiceImpl) GetByUsername(username string) (*User, error) {
 	var user User
 	err := s.db.Where("username = ?", username).First(&user).Error
 	if err != nil {
@@ -107,18 +105,31 @@ func (s *UserService) GetByUsername(username string) (*User, error) {
 	return &user, nil
 }
 
+// GetByEmail retrieves a user by their email address
+func (s *UserServiceImpl) GetByEmail(email string) (*User, error) {
+	var user User
+	err := s.db.Where("email = ?", email).First(&user).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("user not found")
+		}
+		return nil, err
+	}
+	return &user, nil
+}
+
 // Update updates an existing user in the database
-func (s *UserService) Update(user *User) error {
+func (s *UserServiceImpl) Update(user *User) error {
 	return s.db.Save(user).Error
 }
 
 // Delete removes a user from the database
-func (s *UserService) Delete(id uint) error {
+func (s *UserServiceImpl) Delete(id uint) error {
 	return s.db.Delete(&User{}, id).Error
 }
 
 // List retrieves all users with pagination
-func (s *UserService) List(limit, offset int) ([]*User, error) {
+func (s *UserServiceImpl) List(limit, offset int) ([]*User, error) {
 	var users []*User
 	err := s.db.Limit(limit).Offset(offset).Order("username").Find(&users).Error
 	return users, err

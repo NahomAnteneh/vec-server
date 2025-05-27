@@ -7,15 +7,15 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// TokenClaims represents the JWT claims
-type TokenClaims struct {
+// Claims represents the JWT claims
+type Claims struct {
 	UserID uint `json:"user_id"`
 	jwt.RegisteredClaims
 }
 
 // GenerateJWTToken creates a new JWT token for a user
 func GenerateJWTToken(userID uint, secret string, expiresIn time.Duration) (string, error) {
-	claims := &TokenClaims{
+	claims := &Claims{
 		UserID: userID,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(expiresIn)),
@@ -30,8 +30,8 @@ func GenerateJWTToken(userID uint, secret string, expiresIn time.Duration) (stri
 }
 
 // VerifyJWTToken validates a JWT token and returns its claims
-func VerifyJWTToken(tokenString, secret string) (*TokenClaims, error) {
-	token, err := jwt.ParseWithClaims(tokenString, &TokenClaims{}, func(token *jwt.Token) (interface{}, error) {
+func VerifyJWTToken(tokenString, secret string) (*Claims, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
 		// Validate signing method
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")
@@ -40,12 +40,15 @@ func VerifyJWTToken(tokenString, secret string) (*TokenClaims, error) {
 	})
 
 	if err != nil {
-		return nil, err
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return nil, ErrTokenExpired
+		}
+		return nil, ErrInvalidToken
 	}
 
-	if claims, ok := token.Claims.(*TokenClaims); ok && token.Valid {
+	if claims, ok := token.Claims.(*Claims); ok && token.Valid {
 		return claims, nil
 	}
 
-	return nil, errors.New("invalid token")
+	return nil, ErrInvalidToken
 }
