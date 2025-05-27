@@ -118,14 +118,38 @@ func WriteRef(repo *Repository, refPath, commitHash string) error {
 	if repo == nil {
 		return RepositoryError("nil repository", nil)
 	}
+
+	// Validate commitHash is a valid SHA-256 hash
+	if len(commitHash) != 64 || !IsValidHex(commitHash) {
+		return RefError(fmt.Sprintf("invalid commit hash: %s", commitHash), nil)
+	}
+
 	fullPath := filepath.Join(repo.VecDir, refPath)
 
+	// Ensure the directory exists
 	if err := EnsureDirExists(filepath.Dir(fullPath)); err != nil {
 		return RefError("failed to create reference directory", err)
 	}
 
-	if err := WriteFileContent(fullPath, []byte(commitHash), 0644); err != nil {
+	// Add a newline to the end of the hash (Git standard)
+	commitHashWithNewline := commitHash
+	if !strings.HasSuffix(commitHashWithNewline, "\n") {
+		commitHashWithNewline = commitHash + "\n"
+	}
+
+	// Write the reference file with newline termination
+	if err := WriteFileContent(fullPath, []byte(commitHashWithNewline), 0644); err != nil {
 		return RefError("failed to write reference file", err)
+	}
+
+	// Verify the file was written correctly
+	fileContent, err := ReadFileContent(fullPath)
+	if err != nil {
+		return RefError(fmt.Sprintf("failed to verify ref file %s: %v", fullPath, err), err)
+	}
+
+	if len(fileContent) == 0 {
+		return RefError(fmt.Sprintf("ref file %s was written but is empty", fullPath), nil)
 	}
 
 	return nil

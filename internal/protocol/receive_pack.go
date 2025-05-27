@@ -73,9 +73,7 @@ func ReceivePackHandler(repoManager *repository.Manager, logger *log.Logger, aut
 
 		// The initial lines are commands, then optionally a packfile.
 		// We need a scanner for the command part.
-		cmdScanner := bufio.NewScanner(clientReader)
-
-		clientCaps, initialUpdates, err := parseInitialCommandsAndCaps(cmdScanner)
+		clientCaps, initialUpdates, err := parseInitialCommandsAndCaps(clientReader, logger)
 		if err != nil {
 			logger.Printf("RECEIVE_PACK: Error parsing initial commands/caps: %v", err)
 			http.Error(w, fmt.Sprintf("Error parsing initial commands: %v", err), http.StatusBadRequest)
@@ -212,71 +210,114 @@ func ReceivePackHandler(repoManager *repository.Manager, logger *log.Logger, aut
 	}
 }
 
-// RefUpdate and RefUpdateResult structs (remain the same)
-// ...
-type RefUpdate struct{ OldHash, NewHash, RefName string }
+// RefUpdate stores information about a ref update
+type RefUpdate struct {
+	OldHash string
+	NewHash string
+	RefName string
+}
+
+// RefUpdateResult stores the result of a ref update operation
 type RefUpdateResult struct {
 	RefName string
 	Success bool
 	Error   string
 }
 
-// parseInitialCommandsAndCaps parses the initial command lines containing ref updates and capabilities.
-func parseInitialCommandsAndCaps(scanner *bufio.Scanner) (string, []RefUpdate, error) {
+// parseInitialCommandsAndCaps reads the first part of the receive-pack protocol:
+// a series of pkt-lines detailing ref updates and capabilities.
+// It stops when it encounters a flush packet ("0000").
+// The provided reader should be at the start of these command lines.
+func parseInitialCommandsAndCaps(r *bufio.Reader, logger *log.Logger) (string, []RefUpdate, error) {
 	var updates []RefUpdate
 	var clientCaps string
 	firstLine := true
 
 	for {
-		lineText, err := ReadPktLine(scanner)
-		if err == io.EOF {
-			if firstLine && len(updates) == 0 {
-				break
-			}
-			return clientCaps, updates, fmt.Errorf("unexpected EOF before packfile or flush pkt")
-		}
+		// Use the ReadPacketLine from the same 'protocol' package (defined in packet.go)
+		// It returns ([]byte, isFlush, error)
+		pktData, isFlush, err := ReadPacketLine(r) // Use the correct ReadPacketLine
 		if err != nil {
-			return clientCaps, updates, fmt.Errorf("failed to read ref update line: %w", err)
+			// Distinguish EOF after some lines from immediate EOF
+			if err == io.EOF && !firstLine { // EOF after some commands is unexpected before flush
+				return clientCaps, updates, fmt.Errorf("unexpected EOF before flush pkt in command list")
+			} else if err == io.EOF && firstLine && len(updates) == 0 { // EOF immediately is ok if nothing was sent (empty push)
+				logger.Printf("RECEIVE_PACK: Empty initial command list from client (EOF).")
+				break // Treat as empty command list
+			}
+			return clientCaps, updates, fmt.Errorf("failed to read pkt-line for ref update: %w", err)
 		}
 
-		if lineText == FlushPkt {
+		if isFlush { // FlushPkt ("0000") indicates end of commands
+			logger.Printf("RECEIVE_PACK: Encountered flush packet, ending command parsing.")
 			break
 		}
 
+		lineText := string(pktData) // Convert data part of pkt-line to string
+
 		cmdLine := lineText
 		if firstLine {
+			logger.Printf("RECEIVE_PACK: First command line received: %s", lineText)
 			parts := strings.SplitN(lineText, "\x00", 2) // NUL separates command from capabilities
 			cmdLine = parts[0]
 			if len(parts) > 1 {
 				clientCaps = parts[1]
+				logger.Printf("RECEIVE_PACK: Client capabilities extracted: %s", clientCaps)
 			}
 			firstLine = false
 		} else if strings.Contains(lineText, "\x00") { // Subsequent lines *should not* have capabilities
+			logger.Printf("RECEIVE_PACK: Error: Unexpected capabilities string in subsequent ref update line: %s", lineText)
 			return clientCaps, updates, fmt.Errorf("unexpected capabilities string in subsequent ref update line: %s", lineText)
 		}
 
+		logger.Printf("RECEIVE_PACK: Parsing command line: %s", cmdLine)
 		parts := strings.Fields(cmdLine)
 		if len(parts) != 3 {
+			logger.Printf("RECEIVE_PACK: Error: Invalid ref update format: '%s' (got %d parts, expected 3)", cmdLine, len(parts))
 			return clientCaps, updates, fmt.Errorf("invalid ref update format: '%s' (got %d parts)", cmdLine, len(parts))
 		}
 		oldHash, newHash, refName := parts[0], parts[1], parts[2]
+		logger.Printf("RECEIVE_PACK: Parsed update: old=%s, new=%s, ref=%s", oldHash, newHash, refName)
 
-		if !(len(oldHash) == 64 && core.IsValidHex(oldHash)) && oldHash != strings.Repeat("0", 64) { /* Also allow all-zero old hash for new refs */
-			if oldHash != "0000000000000000000000000000000000000000000000000000000000000000" { // Git specific all-zero short form
+		// Validate hashes and refName (copied from existing logic)
+		if !(len(oldHash) == 64 && IsValidHexCore(oldHash)) && oldHash != strings.Repeat("0", 64) {
+			// Allow the git-style 40-char zero hash as well, though our ZeroHash is 64.
+			// The client *should* be sending 64 zeros now for vec.
+			if oldHash != strings.Repeat("0", 40) {
+				logger.Printf("RECEIVE_PACK: Error: Invalid old hash in ref update: %s", oldHash)
 				return clientCaps, updates, fmt.Errorf("invalid old hash in ref update: %s", oldHash)
 			}
+			// If it was the 40-char zero, normalize to 64 for internal consistency if needed,
+			// though the client should be sending 64. For now, accept for parsing.
 		}
-		if !(len(newHash) == 64 && core.IsValidHex(newHash)) && newHash != strings.Repeat("0", 64) {
-			if newHash != "0000000000000000000000000000000000000000000000000000000000000000" {
+		if !(len(newHash) == 64 && IsValidHexCore(newHash)) && newHash != strings.Repeat("0", 64) {
+			if newHash != strings.Repeat("0", 40) {
+				logger.Printf("RECEIVE_PACK: Error: Invalid new hash in ref update: %s", newHash)
 				return clientCaps, updates, fmt.Errorf("invalid new hash in ref update: %s", newHash)
 			}
 		}
 		if !strings.HasPrefix(refName, "refs/") {
+			logger.Printf("RECEIVE_PACK: Error: Invalid ref name (must start with refs/): %s", refName)
 			return clientCaps, updates, fmt.Errorf("invalid ref name (must start with refs/): %s", refName)
 		}
 		updates = append(updates, RefUpdate{OldHash: oldHash, NewHash: newHash, RefName: refName})
+		logger.Printf("RECEIVE_PACK: Added ref update: %s %s %s", oldHash, newHash, refName)
+	}
+	if firstLine && len(updates) == 0 {
+		logger.Printf("RECEIVE_PACK: No commands received before flush/EOF.")
 	}
 	return clientCaps, updates, nil
+}
+
+// IsValidHexCore checks if a string is a valid hex string (helper)
+// This should ideally be from a shared core utility package
+func IsValidHexCore(s string) bool {
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 // processPackfile unpacks objects from the packfile into the repository.
@@ -451,30 +492,98 @@ func updateRefs(repoManager *repository.Manager, repoPath string, updates []RefU
 		}
 
 		// Update the ref using core.WriteRef
-		err = cr.WriteRef(update.RefName, update.NewHash) // Use cr
-		if err != nil {
-			result.Error = fmt.Sprintf("failed to write ref: %v", err)
-			overallSuccess = false
-		} else {
-			result.Success = true
-			logger.Printf("RECEIVE_PACK: Updated ref %s from %s to %s", update.RefName, existingCommit, update.NewHash)
+		// Debug log the values before writing
+		logger.Printf("RECEIVE_PACK: Writing ref %s with hash %s", update.RefName, update.NewHash)
 
-			// If a branch was updated, and it's the default branch (HEAD points to it), update HEAD if it was symbolic
-			// This part is tricky. Git usually updates HEAD if the current branch is pushed.
-			// For simplicity, if HEAD is symbolic and points to this branch, we ensure it stays that way.
-			// If HEAD was detached, this doesn't change it.
-			if strings.HasPrefix(update.RefName, "refs/heads/") {
-				headContent, _ := core.ReadHEADFile(cr)
-				if strings.HasPrefix(headContent, "ref: ") && headContent == "ref: "+update.RefName {
-					// HEAD is already pointing to this symbolic ref, WriteRef updated its target.
-					// If HEAD itself needs to be updated to point to this branch (e.g. initializing repo)
-					// repoManager.UpdateHead(repoPath, strings.TrimPrefix(update.RefName, "refs/heads/"))
-					// This logic is typically for `git push -u origin main` or setting default branch.
-					// For a simple push, just updating the branch ref file is enough.
-					// If we want to ensure HEAD becomes this branch if it's the first push / main branch etc.,
-					// more complex logic or explicit commands are needed.
-					// The `SynchronizeRepository` later will set the default branch in DB from HEAD.
+		// Ensure the ref directory exists
+		refDir := filepath.Dir(filepath.Join(cr.VecDir, update.RefName))
+		if err := os.MkdirAll(refDir, 0755); err != nil {
+			result.Error = fmt.Sprintf("failed to create ref directory: %v", err)
+			overallSuccess = false
+			continue
+		}
+
+		// Write the ref file using a completely new approach
+		refFilePath := filepath.Join(cr.VecDir, update.RefName)
+
+		// Add extensive debugging
+		logger.Printf("DEBUG: Writing ref file at path: %s", refFilePath)
+
+		// Ensure the directory exists (with multiple levels)
+		dirPath := filepath.Dir(refFilePath)
+		if err := os.MkdirAll(dirPath, 0755); err != nil {
+			logger.Printf("DEBUG: Failed to create directory %s: %v", dirPath, err)
+			result.Error = fmt.Sprintf("failed to create ref directory: %v", err)
+			overallSuccess = false
+			continue
+		}
+
+		// Make sure to append a newline to the hash
+		hashWithNewline := update.NewHash + "\n"
+
+		// Use atomic file writing pattern with a temporary file to avoid partial writes
+		tempFile := refFilePath + ".tmp"
+
+		// First, try to write the temporary file
+		err = atomicWriteFile(tempFile, hashWithNewline, 0644, logger)
+		if err != nil {
+			logger.Printf("DEBUG: Failed to write temporary file %s: %v", tempFile, err)
+			result.Error = fmt.Sprintf("failed to write temporary ref file: %v", err)
+			overallSuccess = false
+			continue
+		}
+
+		// Now atomically rename the temporary file to the target file
+		if err := os.Rename(tempFile, refFilePath); err != nil {
+			logger.Printf("DEBUG: Failed to rename temporary file to target: %v", err)
+			result.Error = fmt.Sprintf("failed to finalize ref file: %v", err)
+			overallSuccess = false
+			continue
+		}
+
+		// Verify the file was written correctly
+		content, err := os.ReadFile(refFilePath)
+		if err != nil {
+			logger.Printf("DEBUG: Verification failed - could not read ref file: %v", err)
+		} else if len(content) == 0 {
+			logger.Printf("DEBUG: Verification failed - ref file is empty")
+
+			// Emergency direct write as last resort
+			logger.Printf("DEBUG: Attempting emergency direct write")
+			file, err := os.OpenFile(refFilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+			if err != nil {
+				logger.Printf("DEBUG: Emergency write failed - could not open file: %v", err)
+			} else {
+				_, err = file.WriteString(hashWithNewline)
+				if err != nil {
+					logger.Printf("DEBUG: Emergency write failed - could not write to file: %v", err)
 				}
+				file.Sync()
+				file.Close()
+			}
+		} else {
+			logger.Printf("DEBUG: Verification passed - wrote %d bytes to ref file", len(content))
+			logger.Printf("DEBUG: File content: %s", string(content))
+		}
+
+		result.Success = true
+		logger.Printf("RECEIVE_PACK: Updated ref %s from %s to %s", update.RefName, existingCommit, update.NewHash)
+
+		// If a branch was updated, and it's the default branch (HEAD points to it), update HEAD if it was symbolic
+		// This part is tricky. Git usually updates HEAD if the current branch is pushed.
+		// For simplicity, if HEAD is symbolic and points to this branch, we ensure it stays that way.
+		// If HEAD was detached, this doesn't change it.
+		if strings.HasPrefix(update.RefName, "refs/heads/") {
+			headContent, _ := core.ReadHEADFile(cr)
+			if strings.HasPrefix(headContent, "ref: ") && headContent == "ref: "+update.RefName {
+				// HEAD is already pointing to this symbolic ref, WriteRef updated its target.
+				// If HEAD itself needs to be updated to point to this branch (e.g. initializing repo)
+				// repoManager.UpdateHead(repoPath, strings.TrimPrefix(update.RefName, "refs/heads/"))
+				// This logic is typically for `git push -u origin main` or setting default branch.
+				// For a simple push, just updating the branch ref file is enough.
+				// If we want to ensure HEAD becomes this branch if it's the first push / main branch etc.,
+				// more complex logic or explicit commands are needed.
+				// The `SynchronizeRepository` later will set the default branch in DB from HEAD.
 			}
 		}
 		results = append(results, result)
@@ -580,3 +689,85 @@ func checkFastForward(repoPath string, oldCommitHash string, newCommitHash strin
 // func parseCoreCommitData(data []byte) (*ParsedCommit, error) { return nil, nil}
 // type signature struct { Name, Email string; When time.Time }
 // func parseSignatureLine(line string) (signature, error) { return nil, nil }
+
+// Add these helper functions at the end of the file
+
+// Helper function to get file/directory permissions for debugging
+func getPermissions(path string) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Sprintf("Error getting permissions: %v", err)
+	}
+	return fmt.Sprintf("Mode: %s", info.Mode().String())
+}
+
+// Fallback file writing method using lower-level operations
+func writeFileWithFallback(filename string, data []byte, perm os.FileMode, logger *log.Logger) error {
+	logger.Printf("DEBUG: Writing file with fallback method: %s", filename)
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		logger.Printf("DEBUG: Failed to open file: %v", err)
+		return err
+	}
+
+	n, err := f.Write(data)
+	if err == nil && n < len(data) {
+		err = io.ErrShortWrite
+		logger.Printf("DEBUG: Short write: %d/%d bytes", n, len(data))
+	}
+
+	if err1 := f.Sync(); err1 != nil && err == nil {
+		err = err1
+		logger.Printf("DEBUG: Sync failed: %v", err1)
+	}
+
+	if err1 := f.Close(); err1 != nil && err == nil {
+		err = err1
+		logger.Printf("DEBUG: Close failed: %v", err1)
+	}
+
+	if err == nil {
+		logger.Printf("DEBUG: Successfully wrote file with fallback method")
+	}
+
+	return err
+}
+
+// atomicWriteFile writes data to a file in an atomic way by using a temporary file
+// and then renaming it to the final destination.
+func atomicWriteFile(filename string, content string, perm os.FileMode, logger *log.Logger) error {
+	logger.Printf("DEBUG: Writing file atomically: %s", filename)
+
+	// Create a new file
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		logger.Printf("DEBUG: Failed to create file: %v", err)
+		return err
+	}
+
+	// Write the content
+	_, err = f.WriteString(content)
+	if err != nil {
+		f.Close()
+		logger.Printf("DEBUG: Failed to write content: %v", err)
+		return err
+	}
+
+	// Ensure the write is flushed to disk
+	err = f.Sync()
+	if err != nil {
+		f.Close()
+		logger.Printf("DEBUG: Failed to sync file: %v", err)
+		return err
+	}
+
+	// Close the file
+	err = f.Close()
+	if err != nil {
+		logger.Printf("DEBUG: Failed to close file: %v", err)
+		return err
+	}
+
+	logger.Printf("DEBUG: Successfully wrote file atomically")
+	return nil
+}

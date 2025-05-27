@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath" // Import for joining paths for refs
 	"strings"
 
@@ -88,6 +89,28 @@ func InfoRefsHandler(repoManager *repository.Manager, logger *log.Logger) http.H
 			} else {
 				http.Error(w, "Error reading refs", http.StatusInternalServerError)
 				return
+			}
+		}
+
+		// Add a special check for empty ref files
+		if len(branchMap) == 0 {
+			// Manually check common branches in case refs aren't being properly read but exist as files
+			repoCorePath := filepath.Join(repoPath, ".vec")
+			commonBranches := []string{"main"}
+
+			for _, branch := range commonBranches {
+				branchPath := filepath.Join(repoCorePath, "refs", "heads", branch)
+				if _, err := os.Stat(branchPath); err == nil {
+					// Branch file exists, but might be empty
+					branchContent, err := os.ReadFile(branchPath)
+					if err == nil && len(branchContent) > 0 {
+						commitHash := strings.TrimSpace(string(branchContent))
+						if commitHash != "" && commitHash != strings.Repeat("0", 64) {
+							logger.Printf("INFO_REFS: Found commit %s in branch file %s that wasn't returned by GetBranches", commitHash, branch)
+							branchMap[branch] = commitHash
+						}
+					}
+				}
 			}
 		}
 

@@ -196,19 +196,77 @@ func (m *Manager) GetBranches(repoPath string) (map[string]string, error) {
 	cr := m.getCoreRepository(repoPath)
 	branchNames, err := cr.GetAllBranches() // This is core.GetAllBranches(repoPath)
 	if err != nil {
+		// If it's a not found error for a new repo, return an empty map instead of an error
+		if core.IsErrNotFound(err) {
+			m.logger.Printf("GetBranches: Refs directory not found for %s, likely a new repository. Returning empty branch map.", repoPath)
+			return make(map[string]string), nil
+		}
 		return nil, fmt.Errorf("failed to get branches from core: %w", err)
 	}
 
 	branches := make(map[string]string)
 	for _, branchName := range branchNames {
 		refPath := filepath.Join("refs", "heads", branchName) // Relative to .vec
-		commitHash, err := core.ReadFileContent(filepath.Join(cr.VecDir, refPath))
+		fullRefPath := filepath.Join(cr.VecDir, refPath)
+
+		// Check if the file exists and has content
+		if !core.FileExists(fullRefPath) {
+			m.logger.Printf("Warning: branch ref file doesn't exist: %s", fullRefPath)
+			continue
+		}
+
+		fileInfo, err := os.Stat(fullRefPath)
+		if err != nil {
+			m.logger.Printf("Warning: cannot stat branch ref file %s: %v", fullRefPath, err)
+			continue
+		}
+
+		if fileInfo.Size() == 0 {
+			m.logger.Printf("Warning: branch ref file is empty: %s", fullRefPath)
+
+			// If this is the main branch and we have a HEAD commit, copy it
+			if branchName == "main" {
+				headCommit, headErr := cr.ReadHead()
+				if headErr == nil && headCommit != "" && headCommit != strings.Repeat("0", 64) {
+					m.logger.Printf("Repairing main branch ref with HEAD commit: %s", headCommit)
+					err = cr.WriteRef(refPath, headCommit)
+					if err != nil {
+						m.logger.Printf("Warning: failed to repair main branch ref: %v", err)
+					} else {
+						branches[branchName] = headCommit
+						continue
+					}
+				}
+			}
+
+			// Try to get the hash of the file with "git log" if we have it
+			commitHashBytes, err := os.ReadFile(fullRefPath)
+			if err != nil || len(commitHashBytes) == 0 {
+				// Last resort: check if there are any pushes we can see in the objects dir
+				m.logger.Printf("Warning: could not read branch ref %s for repo %s: %v", branchName, repoPath, err)
+				continue
+			}
+		}
+
+		// Normal flow: read the file content
+		commitHashBytes, err := core.ReadFileContent(fullRefPath)
 		if err != nil {
 			m.logger.Printf("Warning: could not read branch ref %s for repo %s: %v", branchName, repoPath, err)
-			continue // Or return error, depending on desired strictness
+			continue
 		}
-		branches[branchName] = strings.TrimSpace(string(commitHash))
+
+		commitHash := strings.TrimSpace(string(commitHashBytes))
+		if commitHash == "" {
+			m.logger.Printf("Warning: empty commit hash for branch %s", branchName)
+			continue
+		}
+
+		branches[branchName] = commitHash
 	}
+
+	// Debug logging
+	m.logger.Printf("GetBranches: Found %d branches for %s: %v", len(branches), repoPath, branches)
+
 	return branches, nil
 }
 

@@ -135,9 +135,40 @@ func IsIgnored(repoRoot, path string) (bool, error) {
 
 // WriteFileContent writes content to a file with the specified permissions.
 func WriteFileContent(filePath string, content []byte, perm os.FileMode) error {
-	if err := os.WriteFile(filePath, content, perm); err != nil {
-		return FSError(fmt.Sprintf("failed to write file %s", filePath), err)
+	// Ensure the directory exists
+	if err := EnsureDirExists(filepath.Dir(filePath)); err != nil {
+		return FSError(fmt.Sprintf("failed to create directory for %s", filePath), err)
 	}
+
+	// Make sure to create the file and properly flush/sync content
+	f, err := os.Create(filePath)
+	if err != nil {
+		return FSError(fmt.Sprintf("failed to create file %s", filePath), err)
+	}
+
+	// Use defer with a named return value to handle file closing properly
+	defer func() {
+		closeErr := f.Close()
+		if err == nil && closeErr != nil {
+			err = FSError(fmt.Sprintf("failed to close file %s", filePath), closeErr)
+		}
+	}()
+
+	// Write the content
+	if _, err := f.Write(content); err != nil {
+		return FSError(fmt.Sprintf("failed to write content to file %s", filePath), err)
+	}
+
+	// Ensure content is flushed to disk
+	if err := f.Sync(); err != nil {
+		return FSError(fmt.Sprintf("failed to sync file %s", filePath), err)
+	}
+
+	// Set permissions
+	if err := f.Chmod(perm); err != nil {
+		return FSError(fmt.Sprintf("failed to set permissions on file %s", filePath), err)
+	}
+
 	return nil
 }
 

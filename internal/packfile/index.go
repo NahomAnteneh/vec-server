@@ -13,18 +13,38 @@ import (
 
 // WriteIndex generates and writes the packfile index
 func (p *Packfile) WriteIndex(outputPath string) error {
+	if p.HashLength <= 0 {
+		return core.ObjectError("invalid hash length", nil)
+	}
+
 	var idx PackfileIndex
 	idx.Fanout = [256]uint32{}
 	idx.Offsets = make([]uint32, len(p.Objects))
-	idx.Hashes = make([][hashLength]byte, len(p.Objects))
+	idx.Hashes = make([][]byte, len(p.Objects))
 	idx.CRCs = make([]uint32, len(p.Objects))
 	idx.PackChecksum = p.Checksum
 
 	// Populate index
 	for i, obj := range p.Objects {
+		if obj.Offset < 0 {
+			return core.ObjectError(fmt.Sprintf("invalid negative offset %d for object %s", obj.Offset, obj.Hash), nil)
+		}
+
+		// Validate hash bytes
+		if len(obj.HashBytes) != p.HashLength {
+			return core.ObjectError(fmt.Sprintf("invalid hash length for object %s: got %d, expected %d",
+				obj.Hash, len(obj.HashBytes), p.HashLength), nil)
+		}
+
 		idx.Offsets[i] = uint32(obj.Offset)
 		idx.Hashes[i] = obj.HashBytes
 		idx.CRCs[i] = crc32.ChecksumIEEE(obj.Data)
+
+		// Ensure the first byte is valid for fanout index
+		if len(obj.HashBytes) == 0 {
+			return core.ObjectError(fmt.Sprintf("empty hash bytes for object %s", obj.Hash), nil)
+		}
+
 		idx.Fanout[obj.HashBytes[0]]++
 	}
 
@@ -43,13 +63,20 @@ func (p *Packfile) WriteIndex(outputPath string) error {
 			CRC32:  idx.CRCs[i],
 		}
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		return bytes.Compare(p.Objects[i].HashBytes[:], p.Objects[j].HashBytes[:]) < 0
+
+	// Create a copy of objects and hashes for sorting
+	sortedObjects := make([]Object, len(p.Objects))
+	copy(sortedObjects, p.Objects)
+
+	sort.Slice(sortedObjects, func(i, j int) bool {
+		return bytes.Compare(sortedObjects[i].HashBytes, sortedObjects[j].HashBytes) < 0
 	})
-	for i, entry := range entries {
-		idx.Offsets[i] = uint32(entry.Offset)
-		idx.Hashes[i] = p.Objects[i].HashBytes
-		idx.CRCs[i] = entry.CRC32
+
+	// Update index with sorted values
+	for i, obj := range sortedObjects {
+		idx.Offsets[i] = uint32(obj.Offset)
+		idx.Hashes[i] = obj.HashBytes
+		idx.CRCs[i] = crc32.ChecksumIEEE(obj.Data)
 	}
 
 	// Write index
@@ -67,7 +94,11 @@ func (p *Packfile) WriteIndex(outputPath string) error {
 		}
 	}
 	for _, hash := range idx.Hashes {
-		if _, err := buf.Write(hash[:]); err != nil {
+		if len(hash) != p.HashLength {
+			return core.ObjectError(fmt.Sprintf("invalid hash length in index: got %d, expected %d",
+				len(hash), p.HashLength), nil)
+		}
+		if _, err := buf.Write(hash); err != nil {
 			return core.ObjectError("failed to write hash", err)
 		}
 	}
@@ -76,7 +107,13 @@ func (p *Packfile) WriteIndex(outputPath string) error {
 			return core.ObjectError("failed to write CRC", err)
 		}
 	}
-	if _, err := buf.Write(idx.PackChecksum[:]); err != nil {
+
+	if len(idx.PackChecksum) != p.HashLength {
+		return core.ObjectError(fmt.Sprintf("invalid pack checksum length: got %d, expected %d",
+			len(idx.PackChecksum), p.HashLength), nil)
+	}
+
+	if _, err := buf.Write(idx.PackChecksum); err != nil {
 		return core.ObjectError("failed to write pack checksum", err)
 	}
 
@@ -92,6 +129,10 @@ func (p *Packfile) WriteIndex(outputPath string) error {
 
 // ReadIndex reads the packfile index
 func (p *Packfile) ReadIndex(inputPath string) error {
+	if p.HashLength <= 0 {
+		return core.ObjectError("invalid hash length", nil)
+	}
+
 	data, err := core.ReadFileContent(inputPath)
 	if err != nil {
 		return core.FSError(fmt.Sprintf("failed to read index %s", inputPath), err)
@@ -105,7 +146,7 @@ func (p *Packfile) ReadIndex(inputPath string) error {
 		return core.ObjectError("failed to read index header", err)
 	}
 	if string(header[:4]) != "\xFFtOc" || binary.BigEndian.Uint32(header[4:]) != 2 {
-		return core.ObjectError("invalid index header", nil)
+		return core.ObjectError(fmt.Sprintf("invalid index header: %x", header[:]), nil)
 	}
 
 	if err := binary.Read(buf, binary.BigEndian, &idx.Fanout); err != nil {
@@ -113,28 +154,39 @@ func (p *Packfile) ReadIndex(inputPath string) error {
 	}
 
 	numObjects := idx.Fanout[255]
+	if numObjects == 0 {
+		// Empty index
+		p.Index = idx
+		return nil
+	}
+
 	idx.Offsets = make([]uint32, numObjects)
-	idx.Hashes = make([][hashLength]byte, numObjects)
+	idx.Hashes = make([][]byte, numObjects)
 	idx.CRCs = make([]uint32, numObjects)
 
 	for i := uint32(0); i < numObjects; i++ {
 		if err := binary.Read(buf, binary.BigEndian, &idx.Offsets[i]); err != nil {
-			return core.ObjectError("failed to read offset", err)
+			return core.ObjectError(fmt.Sprintf("failed to read offset for object %d", i), err)
 		}
 	}
+
 	for i := uint32(0); i < numObjects; i++ {
-		var hash [hashLength]byte
-		if _, err := io.ReadFull(buf, hash[:]); err != nil {
-			return core.ObjectError("failed to read hash", err)
+		hash := make([]byte, p.HashLength)
+		if _, err := io.ReadFull(buf, hash); err != nil {
+			return core.ObjectError(fmt.Sprintf("failed to read hash for object %d", i), err)
 		}
 		idx.Hashes[i] = hash
 	}
+
 	for i := uint32(0); i < numObjects; i++ {
 		if err := binary.Read(buf, binary.BigEndian, &idx.CRCs[i]); err != nil {
-			return core.ObjectError("failed to read CRC", err)
+			return core.ObjectError(fmt.Sprintf("failed to read CRC for object %d", i), err)
 		}
 	}
-	if _, err := io.ReadFull(buf, idx.PackChecksum[:]); err != nil {
+
+	// Read pack checksum
+	idx.PackChecksum = make([]byte, p.HashLength)
+	if _, err := io.ReadFull(buf, idx.PackChecksum); err != nil {
 		return core.ObjectError("failed to read pack checksum", err)
 	}
 

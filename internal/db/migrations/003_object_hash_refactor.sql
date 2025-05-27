@@ -30,13 +30,16 @@ ALTER TABLE commits ALTER COLUMN committed_at DROP DEFAULT;
 
 -- Create 'commit_parents' join table for many-to-many relationship between commits (parents/children)
 CREATE TABLE IF NOT EXISTS commit_parents (
-    child_commit_id VARCHAR(64) NOT NULL REFERENCES commits(commit_id) ON DELETE CASCADE,
-    parent_commit_id VARCHAR(64) NOT NULL REFERENCES commits(commit_id) ON DELETE CASCADE,
-    PRIMARY KEY (child_commit_id, parent_commit_id)
+    repository_id INTEGER NOT NULL,
+    child_commit_id VARCHAR(64) NOT NULL,
+    parent_commit_id VARCHAR(64) NOT NULL,
+    PRIMARY KEY (repository_id, child_commit_id, parent_commit_id),
+    FOREIGN KEY (repository_id, child_commit_id) REFERENCES commits (repository_id, commit_id) ON DELETE CASCADE,
+    FOREIGN KEY (repository_id, parent_commit_id) REFERENCES commits (repository_id, commit_id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_commit_parents_child_id ON commit_parents(child_commit_id);
-CREATE INDEX IF NOT EXISTS idx_commit_parents_parent_id ON commit_parents(parent_commit_id);
+CREATE INDEX IF NOT EXISTS idx_commit_parents_repo_child_id ON commit_parents(repository_id, child_commit_id);
+CREATE INDEX IF NOT EXISTS idx_commit_parents_repo_parent_id ON commit_parents(repository_id, parent_commit_id);
 
 
 -- Alter 'branches' table
