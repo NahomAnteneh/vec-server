@@ -64,7 +64,7 @@ func LoadConfig() *Config {
 		RepoBasePath:    getEnvStr("REPO_BASE_PATH", "./repos"),
 		RepoDirPerms:    getEnvFileMode("REPO_DIR_PERMS", 0755),
 		ShutdownTimeout: getEnvDuration("SHUTDOWN_TIMEOUT", 30*time.Second),
-		DatabaseURL:     getEnvStr("DATABASE_URL", "postgresql://neondb_owner:npg_8OKrybDhPx5T@ep-lucky-waterfall-a51p4m44-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require"),
+		DatabaseURL:     getEnvStr("DATABASE_URL", ""),
 		TLSCertPath:     getEnvStr("TLS_CERT_PATH", ""),
 		TLSKeyPath:      getEnvStr("TLS_KEY_PATH", ""),
 		JWTSecret:       getEnvStr("JWT_SECRET", "vec-server-default-secret-key"),
